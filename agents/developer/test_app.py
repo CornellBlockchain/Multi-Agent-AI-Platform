@@ -99,6 +99,15 @@ def test_failure_leaks_no_detail_to_the_caller(monkeypatch):
     assert not any("abc123" in event["message"] for event in body["events"])
 
 
+def test_unexpected_failure_keeps_its_detail_in_the_log(monkeypatch, capsys):
+    """Nothing crosses the wire, but the detail must survive somewhere."""
+    stub_tool(monkeypatch, error=RuntimeError("token ghp_SECRET123 rejected"))
+    body = client.post("/execute", json=TASK).json()
+
+    assert body["error"] == "RuntimeError"
+    assert "ghp_SECRET123" in capsys.readouterr().out
+
+
 def test_tool_error_message_reaches_the_caller(monkeypatch):
     """ToolError text is written by us and meant to be displayed, so it travels."""
     stub_tool(monkeypatch, error=ToolError("GITHUB_TOKEN not set!"))

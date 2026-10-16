@@ -102,7 +102,11 @@ async def run_tool(name, args, ctx):
         result = await tool["fn"](**args)
     except Exception as e:
         ms = round((time.perf_counter() - start) * 1000)
-        msg = str(e) if isinstance(e, ToolError) else type(e).__name__
+        expected = isinstance(e, ToolError)
+        msg = str(e) if expected else type(e).__name__
+        if not expected:
+            # Only the type travels, so keep the detail here or it is lost.
+            print(f"[error] {name} {call_id[:8]}: {type(e).__name__}: {e}", flush=True)
         emit(ctx, "tool.failed", name, call_id, f"{name} failed: {msg}", duration_ms=ms)
         return {"error": msg}
 
