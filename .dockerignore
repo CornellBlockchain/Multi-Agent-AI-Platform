@@ -1,0 +1,24 @@
+# Secret API keys and environment files
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python generated files
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Git files
+.git/
+.gitignore
+
+# IDE and OS files
+.vscode/
+.DS_Store
+
+# Local tests
+test_*.py
