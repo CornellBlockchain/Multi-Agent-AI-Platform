@@ -93,6 +93,15 @@ def test_failure_leaks_no_detail_to_the_caller(monkeypatch):
     assert not any("abc123" in event["message"] for event in body["events"])
 
 
+def test_tool_error_message_reaches_the_caller(monkeypatch):
+    """ToolError text is written by us and meant to be displayed, so it travels."""
+    stub_tool(monkeypatch, error=service.ToolError("GITHUB_TOKEN not set!"))
+    body = client.post("/execute", json=TASK).json()
+
+    assert body["error"] == "GITHUB_TOKEN not set!"
+    assert "GITHUB_TOKEN not set!" in body["events"][-1]["message"]
+
+
 def test_empty_instruction_fails_without_running_a_tool(monkeypatch):
     stub_tool(monkeypatch, result=TOOL_RESULT)
     body = client.post("/execute", json={**TASK, "instruction": "   "}).json()

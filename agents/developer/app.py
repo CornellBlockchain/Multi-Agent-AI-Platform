@@ -29,7 +29,17 @@ load_dotenv()
 
 AGENT = "developer"
 
-from tools import github_search
+from tools import ToolError, github_search
+
+
+def safe_error(exc: Exception) -> str:
+    """What may cross the wire to Team C.
+
+    ToolError messages are written by us and meant to be displayed. Any other
+    exception may carry a provider response or credentials, so only its type
+    travels; the detail stays in this service's own log.
+    """
+    return str(exc) if isinstance(exc, ToolError) else type(exc).__name__
 
 
 # --- Contract models (shared/README.md#task-and-result-fields) ---------------
@@ -111,12 +121,11 @@ async def run_tool(
     try:
         result = await fn(*args)
     except Exception as exc:
-        # Exception type only: the contract forbids provider keys in messages.
         log.emit(
             type="tool.failed",
             tool=tool,
             tool_call_id=tool_call_id,
-            message=f"{tool} failed: {type(exc).__name__}",
+            message=f"{tool} failed: {safe_error(exc)}",
             duration_ms=round((time.monotonic() - began) * 1000),
         )
         raise
@@ -159,22 +168,16 @@ async def execute(task: AgentTask) -> AgentResult:
     if not task.instruction.strip():
         return failed("No instruction was supplied, so no tool ran.", "empty instruction")
 
-    if github_search is None:
-        return failed("No developer tools are available yet.", "tools.py not implemented")
-
     # ponytail: one tool, called directly. Gemini-driven tool selection is step 4
     # of agents/developer/README.md and needs the shared call_gemini helper that
     # Team C has not built -- swap this call for the model loop once it lands.
     try:
         result = await run_tool(log, "github_search", "Searching GitHub", github_search, task.instruction)
     except Exception as exc:
-        # The exception type only. Tool exceptions can carry provider responses,
-        # and `error` crosses the wire to Team C; the contract forbids keys and
-        # raw credentials in messages. Detail stays in this service's own log.
         print(f"[error] github_search: {type(exc).__name__}: {exc}", flush=True)
         return failed(
             f"GitHub search could not complete for {task.instruction!r}.",
-            type(exc).__name__,
+            safe_error(exc),
         )
 
     return AgentResult(
