@@ -4,3 +4,4 @@ httpx
 google-genai
 pydantic
 python-dotenv
+pytest
