@@ -1,0 +1,167 @@
+@import "tailwindcss";
+@import "@fontsource-variable/instrument-sans";
+@import "@fontsource-variable/source-serif-4";
+@import "@fontsource-variable/jetbrains-mono";
+
+/*
+ * Design tokens. Charcoal workspace; teal = research lane, blue = developer
+ * lane; amber is reserved for the primary action, focus, and "needs attention"
+ * states. Status colour is always paired with an icon and a text label.
+ */
+@theme {
+  --font-sans: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Source Serif 4 Variable", ui-serif, Georgia, serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", monospace;
+
+  --color-canvas: #1d2023;
+  --color-surface: #24282c;
+  --color-raised: #2b3035;
+  --color-line: #363c42;
+  --color-line-strong: #4a5158;
+  --color-ink: #e8eaec;
+  --color-ink-muted: #b0b7be;
+  --color-ink-faint: #8d969e;
+
+  --color-research: #2fb3a3;
+  --color-research-ink: #7fdccf;
+  --color-research-wash: #1f2e2d;
+  --color-developer: #5b93f0;
+  --color-developer-ink: #a5c4f7;
+  --color-developer-wash: #212a38;
+
+  --color-amber: #e3a845;
+  --color-amber-ink: #f2cf8f;
+  --color-amber-wash: #3a3022;
+  --color-danger: #ef6b5f;
+  --color-danger-ink: #f6a69e;
+  --color-danger-wash: #3a2424;
+
+  --text-2xs: 0.75rem;
+  --text-2xs--line-height: 1.1rem;
+}
+
+@layer base {
+  html {
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--color-canvas);
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-amber);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--color-amber) 40%, transparent);
+  }
+}
+
+@layer components {
+  /* Lane colour is set once per lane and inherited by everything inside. */
+  .lane-research {
+    --lane: var(--color-research);
+    --lane-ink: var(--color-research-ink);
+    --lane-wash: var(--color-research-wash);
+  }
+  .lane-developer {
+    --lane: var(--color-developer);
+    --lane-ink: var(--color-developer-ink);
+    --lane-wash: var(--color-developer-wash);
+  }
+
+  /* The synthesized answer reads as written prose, set apart from the UI. */
+  .answer-prose {
+    font-family: var(--font-serif);
+    font-size: 1.0667rem;
+    line-height: 1.7;
+    color: var(--color-ink);
+    max-width: 68ch;
+    overflow-wrap: break-word;
+  }
+  .answer-prose > * + * {
+    margin-top: 0.9em;
+  }
+  .answer-prose h1,
+  .answer-prose h2,
+  .answer-prose h3 {
+    font-family: var(--font-sans);
+    font-weight: 600;
+    line-height: 1.3;
+    margin-top: 1.4em;
+  }
+  .answer-prose h1 { font-size: 1.25rem; }
+  .answer-prose h2 { font-size: 1.125rem; }
+  .answer-prose h3 { font-size: 1rem; }
+  .answer-prose ul { list-style: disc; padding-left: 1.3em; }
+  .answer-prose ol { list-style: decimal; padding-left: 1.3em; }
+  .answer-prose li + li { margin-top: 0.3em; }
+  .answer-prose a {
+    color: var(--color-amber-ink);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+  }
+  .answer-prose code {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    background: var(--color-surface);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+  }
+  .answer-prose pre {
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    line-height: 1.55;
+    background: var(--color-canvas);
+    border: 1px solid var(--color-line);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    overflow-x: auto;
+  }
+  .answer-prose pre code { background: none; padding: 0; }
+  .answer-prose blockquote {
+    border-left: 2px solid var(--color-line-strong);
+    padding-left: 1em;
+    color: var(--color-ink-muted);
+  }
+  .answer-prose table {
+    display: block;
+    overflow-x: auto;
+    border-collapse: collapse;
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+  }
+  .answer-prose th,
+  .answer-prose td {
+    border: 1px solid var(--color-line);
+    padding: 0.35em 0.6em;
+    text-align: left;
+  }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.spinner {
+  animation: spin 0.9s linear infinite;
+}
+@keyframes row-settle {
+  from { background-color: color-mix(in oklab, var(--lane, var(--color-amber)) 22%, transparent); }
+  to { background-color: transparent; }
+}
+.row-settle {
+  animation: row-settle 1.2s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation-duration: 2.4s; }
+  .row-settle { animation: none; }
+}
