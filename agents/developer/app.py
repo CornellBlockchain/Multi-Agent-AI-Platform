@@ -29,13 +29,7 @@ load_dotenv()
 
 AGENT = "developer"
 
-# ponytail: tools.py is Santino's and still empty. Importing defensively means
-# this service starts and /health answers before any tool exists. Drop the
-# fallback once github_search lands.
-try:
-    from tools import github_search
-except ImportError:  # pragma: no cover - removed when tools.py lands
-    github_search = None
+from tools import github_search
 
 
 # --- Contract models (shared/README.md#task-and-result-fields) ---------------
