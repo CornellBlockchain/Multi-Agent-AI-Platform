@@ -8,6 +8,8 @@ stubbed, so these need no network, no keys and no tools.py.
 from fastapi.testclient import TestClient
 
 import app as service
+import tools
+from tools import ToolError
 
 client = TestClient(service.app)
 
@@ -22,12 +24,16 @@ TOOL_RESULT = {
 
 
 def stub_tool(monkeypatch, result=None, error=None):
-    async def fake_github_search(query, limit=5):
+    """Swap the registry entry, since run_tool resolves tools by name."""
+
+    async def fake_github_search(query):
         if error is not None:
             raise error
         return result
 
-    monkeypatch.setattr(service, "github_search", fake_github_search)
+    monkeypatch.setitem(
+        tools.TOOLS, "github_search", {"fn": fake_github_search, "start": "Searching GitHub"}
+    )
 
 
 def test_health():
@@ -95,7 +101,7 @@ def test_failure_leaks_no_detail_to_the_caller(monkeypatch):
 
 def test_tool_error_message_reaches_the_caller(monkeypatch):
     """ToolError text is written by us and meant to be displayed, so it travels."""
-    stub_tool(monkeypatch, error=service.ToolError("GITHUB_TOKEN not set!"))
+    stub_tool(monkeypatch, error=ToolError("GITHUB_TOKEN not set!"))
     body = client.post("/execute", json=TASK).json()
 
     assert body["error"] == "GITHUB_TOKEN not set!"
