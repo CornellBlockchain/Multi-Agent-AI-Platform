@@ -1,0 +1,17 @@
+# Environment variables and API keys
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python generated files
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE and operating system files
+.vscode/
+.DS_Store
