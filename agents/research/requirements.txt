@@ -2,3 +2,5 @@ httpx
 python-dotenv
 pytest
 pytest-asyncio
+fastapi
+uvicorn
