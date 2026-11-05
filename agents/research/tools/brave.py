@@ -8,11 +8,15 @@ load_dotenv()
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
 
 
+class BraveSearchError(Exception):
+    """Raised when the Brave Search request fails (bad key, rate limit, network, ...)."""
+
+
 async def brave_search(query: str) -> dict:
     """Search the web using Brave Search API."""
 
     # 1. Check the search query
-    if not query.strip():
+    if not query or not query.strip():
         raise ValueError("Search query cannot be empty")
 
     # 2. Get API key from environment
@@ -34,14 +38,32 @@ async def brave_search(query: str) -> dict:
     }
 
     # 4. Call Brave Search
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.get(
-            BRAVE_URL,
-            headers=headers,
-            params=params,
-        )
-        response.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                BRAVE_URL,
+                headers=headers,
+                params=params,
+            )
+    except httpx.TimeoutException:
+        raise BraveSearchError("Brave Search timed out")
+    except httpx.RequestError:
+        raise BraveSearchError("Could not connect to Brave Search")
+
+    status = response.status_code
+    if status in (401, 403):
+        raise BraveSearchError("Brave API key is invalid or not authorized")
+    if status == 429:
+        raise BraveSearchError("Brave Search rate limit reached, try again later")
+    if status >= 500:
+        raise BraveSearchError(f"Brave Search server error (HTTP {status})")
+    if status >= 400:
+        raise BraveSearchError(f"Brave Search request failed (HTTP {status})")
+
+    try:
         data = response.json()
+    except ValueError:
+        raise BraveSearchError("Brave Search returned an unreadable response")
 
     # 5. Extract search results
     results = (data.get("web") or {}).get("results", [])
