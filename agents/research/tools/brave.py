@@ -3,6 +3,8 @@ import os
 import httpx
 from dotenv import load_dotenv
 
+from events import run_tool_with_events
+
 load_dotenv()
 
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
@@ -107,3 +109,14 @@ async def brave_search(query: str) -> dict:
             if passages else []
         ),
     }
+
+
+async def brave_search_with_events(query: str, *, run_id: str, task_id: str, events: list) -> dict:
+    """Run brave_search and record tool.started / tool.completed / tool.failed events."""
+    return await run_tool_with_events(
+        "brave_search", brave_search, (query,),
+        run_id=run_id, task_id=task_id, events=events,
+        start_message="Searching the web with Brave",
+        done_message=lambda result: result["message"],
+        fail_message="Brave search failed",
+    )
