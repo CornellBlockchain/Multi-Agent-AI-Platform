@@ -1,17 +1,60 @@
 """Contract checks for the developer agent service.
 
 Covers the agreements Team C depends on: echoed identifiers, the
-start-before-terminal event rule, and a structured failed result. The tool is
-stubbed, so these need no network, no keys and no tools.py.
+start-before-terminal event rule, and a structured failed result. Gemini and
+the tool are both stubbed, so these need no network and no keys.
 """
 
+import asyncio
+from types import SimpleNamespace
+
+import pytest
 from fastapi.testclient import TestClient
+from google.genai import types
 
 import app as service
 import tools
 from tools import ToolError
 
 client = TestClient(service.app)
+REAL_CALL_GEMINI = service.call_gemini
+
+
+def text_reply(text):
+    return SimpleNamespace(function_calls=None, text=text, candidates=[])
+
+
+def tool_reply(name, args):
+    call = types.FunctionCall(name=name, args=args)
+    content = types.Content(role="model", parts=[types.Part(function_call=call)])
+    return SimpleNamespace(
+        function_calls=[call], text=None, candidates=[SimpleNamespace(content=content)]
+    )
+
+
+def stub_gemini(monkeypatch, replies):
+    """Replace call_gemini with a script of replies; record what it was sent."""
+    script = iter(replies)
+    seen = []
+
+    async def fake_call_gemini(contents, config=None):
+        seen.append(list(contents))
+        reply = next(script)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(service, "call_gemini", fake_call_gemini)
+    return seen
+
+
+@pytest.fixture(autouse=True)
+def default_gemini(monkeypatch):
+    """By default Gemini searches GitHub once, then summarises."""
+    return stub_gemini(monkeypatch, [
+        tool_reply("github_search", {"query": "duckdb language:python"}),
+        text_reply("duckdb/duckdb is the main repository."),
+    ])
 
 TASK = {"run_id": "run-1", "task_id": "task-dev-1", "instruction": "duckdb python"}
 
@@ -128,3 +171,118 @@ def test_empty_instruction_fails_without_running_a_tool(monkeypatch):
 
 def test_malformed_task_is_rejected():
     assert client.post("/execute", json={"instruction": "no identifiers"}).status_code == 422
+
+
+# --- Gemini loop ---------------------------------------------------------------
+
+def test_gemini_chooses_the_tool_input(monkeypatch):
+    """The tool gets Gemini's query, not the raw instruction."""
+    received = []
+
+    async def fake_github_search(query):
+        received.append(query)
+        return TOOL_RESULT
+
+    monkeypatch.setitem(
+        tools.TOOLS, "github_search", {"fn": fake_github_search, "start": "Searching GitHub"}
+    )
+    body = client.post("/execute", json=TASK).json()
+
+    assert received == ["duckdb language:python"]
+    assert body["summary"] == "duckdb/duckdb is the main repository."
+
+
+def test_tool_result_is_sent_back_to_gemini(monkeypatch, default_gemini):
+    stub_tool(monkeypatch, result=TOOL_RESULT)
+    client.post("/execute", json=TASK)
+
+    second_turn = default_gemini[1]
+    response_part = second_turn[-1].parts[0].function_response
+    assert response_part.name == "github_search"
+    assert response_part.response["message"] == "Found 2 repositories"
+
+
+def test_backend_context_object_is_accepted(monkeypatch):
+    """backend/app/models.py sends context as an object, default {}."""
+    stub_tool(monkeypatch, result=TOOL_RESULT)
+    response = client.post("/execute", json={**TASK, "context": {"query": "original question"}})
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+
+
+def test_answer_without_tools_is_completed(monkeypatch):
+    stub_gemini(monkeypatch, [text_reply("Nothing to search for.")])
+    body = client.post("/execute", json=TASK).json()
+
+    assert body["status"] == "completed"
+    assert body["events"] == []
+
+
+def test_gemini_failure_is_structured_and_hides_detail(monkeypatch, capsys):
+    stub_gemini(monkeypatch, [RuntimeError("bad key AIzaSECRET")])
+    body = client.post("/execute", json=TASK).json()
+
+    assert body["status"] == "failed"
+    assert body["error"] == "RuntimeError"
+    assert "AIzaSECRET" not in body["summary"]
+    assert "AIzaSECRET" in capsys.readouterr().out
+
+
+def test_gemini_timeout_is_a_failed_result(monkeypatch):
+    stub_gemini(monkeypatch, [asyncio.TimeoutError()])
+    body = client.post("/execute", json=TASK).json()
+
+    assert body["status"] == "failed"
+    assert body["error"] == "TimeoutError"
+
+
+def test_missing_gemini_key_is_reported(monkeypatch):
+    monkeypatch.setattr(service, "call_gemini", REAL_CALL_GEMINI)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    body = client.post("/execute", json=TASK).json()
+
+    assert body["status"] == "failed"
+    assert body["error"] == "GEMINI_API_KEY not set!"
+
+
+def test_unknown_tool_from_gemini_does_not_crash(monkeypatch):
+    stub_gemini(monkeypatch, [
+        tool_reply("does_not_exist", {}),
+        text_reply("I could not use that tool."),
+    ])
+    body = client.post("/execute", json=TASK).json()
+
+    assert [e["type"] for e in body["events"]] == ["tool.started", "tool.failed"]
+    assert body["status"] == "failed"
+
+
+def test_last_turn_forces_an_answer(monkeypatch, default_gemini):
+    """A model that keeps searching is made to answer; findings are kept."""
+    stub_tool(monkeypatch, result=TOOL_RESULT)
+    configs = []
+    replies = iter([tool_reply("github_search", {"query": "x"})] * (service.MAX_TURNS - 1)
+                   + [text_reply("Summary from what I found.")])
+
+    async def fake_call_gemini(contents, config=None):
+        configs.append(config)
+        return next(replies)
+
+    monkeypatch.setattr(service, "call_gemini", fake_call_gemini)
+    body = client.post("/execute", json=TASK).json()
+
+    assert body["status"] == "completed"
+    assert body["summary"] == "Summary from what I found."
+    assert configs[-1].tool_config.function_calling_config.mode == "NONE"
+    assert configs[0].tool_config is None
+    # Same repository from repeated searches is listed once.
+    assert len(body["sources"]) == 1
+
+
+def test_model_ignoring_the_final_turn_still_fails_cleanly(monkeypatch):
+    stub_tool(monkeypatch, result=TOOL_RESULT)
+    stub_gemini(monkeypatch, [tool_reply("github_search", {"query": "x"})] * service.MAX_TURNS)
+    body = client.post("/execute", json=TASK).json()
+
+    assert body["status"] == "failed"
+    assert "No final answer" in body["error"]
+    assert body["sources"], "partial findings are still returned to Team C"
