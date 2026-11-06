@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+import re
 
 import httpx
 
@@ -9,6 +10,33 @@ from google.genai import types
 
 class ToolError(Exception):
     """tool failure with displayed message"""
+
+GITHUB_API = "https://api.github.com"
+REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+async def github_get(path: str, raw: bool = False) -> httpx.Response:
+    """Get from the github api. raw=True returns file contents as plain"""
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise ToolError("GITHUB_TOKEN not set!")
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        r = await client.get(f"{GITHUB_API}{path}", headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        })
+        if r.status_code == 404:
+            raise ToolError(f"Not found on GitHub: {path}")
+        if r.status_code != 200:
+            raise ToolError(f"GitHub returned HTTP {r.status_code}")
+        return r
+
+def check_repo(repo: str) -> str:
+    """accept 'owner/name' or a full GitHub URL, returns 'owner/name'."""
+    repo = repo.strip().removeprefix("https://github.com/").strip("/")
+    if not REPO_RE.match(repo):
+        raise ToolError(f"Expected 'owner/name', got '{repo}'")
+    return repo
 
 def emit(ctx, type, tool, tool_call_id, message, **extra):
     event = {
@@ -68,8 +96,73 @@ async def github_search(query: str) -> dict:
         "artifacts": [],
     }
 
+MAX_TREE_PATHS = 300
+
+async def repo_overview(repo: str) -> dict:
+    repo = check_repo(repo)
+
+    # metadata
+    info = (await github_get(f"/repos/{repo}")).json()
+    branch = info['default_branch']
+
+    # readme
+    try:
+        readme = (await github_get(f'/repos/{repo}/readme', raw = True)).text
+    except ToolError:
+        readme = "(no README)"
+
+    # default branch paths
+
+    tree = (await github_get(f'/repos/{repo}/git/trees/{branch}?recursive=1')).json()
+    files = [t["path"] for t in tree.get("tree", []) if t["type"] == "blob"]
+    shown = files[:MAX_TREE_PATHS]
+    more = f"\n... {len(files) - len(shown)} more files" if len(files) > len(shown) else ""
+
+    url = info['html_url']
+    return{
+    "message": f"Inspected {repo} ({len(files)} files)",
+        "summary": (
+            f"{repo}: {info.get('description') or 'no description'}\n"
+            f"{info['stargazers_count']} stars, language {info.get('language') or 'n/a'}, "
+            f"default branch {branch}.\n\n"
+            f"README (start):\n{readme[:3000]}\n\n"
+            f"Files:\n" + "\n".join(shown) + more
+        ),
+        "sources": [
+            {"title": repo, "url": url},
+            {"title": f"{repo} README", "url": f"{url}#readme"},
+        ],
+        "artifacts": [{"name": f"{repo} file tree", "content": "\n".join(shown) + more}]
+    }
+
+MAX_FILE_CHARS = 12_000
+
+async def read_repo_file(repo: str, path: str) -> dict:
+    repo = check_repo(repo)
+    path = path.strip().lstrip("/")
+    if not path or ".." in path.split("/"):
+        raise ToolError(f"Invalid file path '{path}'")
+
+    r = await github_get(f"/repos/{repo}/contents/{path}", raw=True)
+    if r.headers.get("content-type", "").startswith("application/json"):
+        raise ToolError(f"'{path}' is a directory, not a file")
+
+    text = r.text
+    truncated = len(text) > MAX_FILE_CHARS
+    text = text[:MAX_FILE_CHARS]
+
+    return {
+        "message": f"Read {path}" + (" (truncated)" if truncated else ""),
+        "summary": text,
+        "sources": [{"title": f"{repo}/{path}", "url": f"https://github.com/{repo}/blob/HEAD/{path}"}],
+        "artifacts": [{"name": f"{repo}/{path}", "content": text}],
+    }
+
 TOOLS = {
     "github_search": {"fn": github_search, "start": "Searching GitHub"},
+    "repo_overview": {"fn": repo_overview, "start": "Inspecting repository"},
+    "read_repo_file": {"fn": read_repo_file, "start": "Reading repository file"},
+
 }
 
 TOOL_DECLARATIONS = [
@@ -88,6 +181,25 @@ TOOL_DECLARATIONS = [
             "required": ["query"],
         },
     ),
+    types.FunctionDeclaration(
+        name="repo_overview",
+        description="Inspect one GitHub repository: description, stars, language, README "
+                    "and file tree. Use after github_search to look inside a result, "
+                    "and to find file paths for read_repo_file.",
+        parameters={"type": "OBJECT", "properties": {
+            "repo": {"type": "STRING", "description": "owner/name, e.g. 'duckdb/duckdb'"},
+        }, "required": ["repo"]},
+    ),
+    types.FunctionDeclaration(
+        name="read_repo_file",
+        description="Read the source of one file in a GitHub repository. Use a path "
+                    "taken from repo_overview's file tree, not a guessed one.",
+        parameters={"type": "OBJECT", "properties": {
+            "repo": {"type": "STRING", "description": "owner/name"},
+            "path": {"type": "STRING", "description": "file path, e.g. 'fastapi/routing.py'"},
+        }, "required": ["repo", "path"]},
+    ),
+
 ]
 
 async def run_tool(name, args, ctx):
