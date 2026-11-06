@@ -286,3 +286,146 @@ def test_model_ignoring_the_final_turn_still_fails_cleanly(monkeypatch):
     assert body["status"] == "failed"
     assert "No final answer" in body["error"]
     assert body["sources"], "partial findings are still returned to Team C"
+
+
+# --- playwright_browse --------------------------------------------------------
+# The browser is faked, and public addresses are numeric so no DNS is needed.
+
+PUBLIC_URL = "https://8.8.8.8/docs"
+
+
+class FakePage:
+    def __init__(self, text="Install with pip.", final_url=PUBLIC_URL, status=200, goto_error=None):
+        self.text = text
+        self.url = final_url
+        self.status = status
+        self.goto_error = goto_error
+
+    def set_default_timeout(self, ms):
+        pass
+
+    async def route(self, pattern, handler):
+        pass
+
+    async def goto(self, url, wait_until):
+        if self.goto_error is not None:
+            raise self.goto_error
+        return SimpleNamespace(status=self.status)
+
+    async def wait_for_load_state(self, state, timeout):
+        pass
+
+    async def title(self):
+        return "DuckDB docs"
+
+    async def inner_text(self, selector):
+        return self.text
+
+
+def stub_browser(monkeypatch, page):
+    """Replace async_playwright so nothing launches. Returns the fake browser."""
+
+    class FakeBrowser:
+        closed = False
+
+        async def new_page(self, **kwargs):
+            return page
+
+        async def close(self):
+            self.closed = True
+
+    browser = FakeBrowser()
+
+    async def launch(headless):
+        return browser
+
+    class FakePlaywright:
+        chromium = SimpleNamespace(launch=launch)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(tools, "async_playwright", FakePlaywright)
+    return browser
+
+
+def browse(url=PUBLIC_URL):
+    return asyncio.run(tools.playwright_browse(url))
+
+
+def test_every_tool_is_declared_to_gemini():
+    assert {d.name for d in tools.TOOL_DECLARATIONS} == set(tools.TOOLS)
+
+
+def test_browse_returns_title_text_and_final_url(monkeypatch):
+    browser = stub_browser(monkeypatch, FakePage(final_url="https://8.8.8.8/final"))
+    result = browse()
+
+    assert result["message"] == "Read DuckDB docs"
+    assert result["sources"] == [{"title": "DuckDB docs", "url": "https://8.8.8.8/final"}]
+    assert result["artifacts"][0]["content"] == "Install with pip."
+    assert browser.closed
+
+
+def test_browse_cuts_long_pages_and_says_so(monkeypatch):
+    stub_browser(monkeypatch, FakePage(text="x" * (tools.MAX_PAGE_CHARS + 1)))
+    result = browse()
+
+    assert len(result["artifacts"][0]["content"]) == tools.MAX_PAGE_CHARS
+    assert f"first {tools.MAX_PAGE_CHARS} characters" in result["summary"]
+
+
+def test_browse_page_without_text_still_reports_the_source(monkeypatch):
+    stub_browser(monkeypatch, FakePage(text="   "))
+    result = browse()
+
+    assert result["artifacts"] == []
+    assert result["sources"][0]["url"] == PUBLIC_URL
+
+
+@pytest.mark.parametrize("url", [
+    "http://localhost:8000/internal",
+    "http://127.0.0.1/",
+    "http://10.0.0.5/",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://[::1]/",
+    "http://[::ffff:127.0.0.1]/",
+    "file:///etc/passwd",
+    "ftp://8.8.8.8/",
+    "not a url",
+])
+def test_browse_refuses_unsafe_addresses_before_opening_a_browser(monkeypatch, url):
+    browser = stub_browser(monkeypatch, FakePage())
+
+    with pytest.raises(ToolError):
+        browse(url)
+    assert not browser.closed, "the browser must never have been launched"
+
+
+def test_browse_refuses_a_redirect_to_a_private_address(monkeypatch):
+    stub_browser(monkeypatch, FakePage(final_url="http://127.0.0.1/admin", text="secret"))
+
+    with pytest.raises(ToolError, match="private"):
+        browse()
+
+
+def test_browse_reports_http_errors(monkeypatch):
+    stub_browser(monkeypatch, FakePage(status=404))
+
+    with pytest.raises(ToolError, match="HTTP 404"):
+        browse()
+
+
+@pytest.mark.parametrize("error, message", [
+    (tools.PlaywrightTimeoutError("slow"), "too long"),
+    (tools.PlaywrightError("net::ERR_FAILED"), "could not be opened"),
+])
+def test_browse_failures_close_the_browser_with_a_clear_message(monkeypatch, error, message):
+    browser = stub_browser(monkeypatch, FakePage(goto_error=error))
+
+    with pytest.raises(ToolError, match=message):
+        browse()
+    assert browser.closed
