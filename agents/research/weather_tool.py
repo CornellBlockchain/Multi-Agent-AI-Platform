@@ -13,7 +13,7 @@ from uuid import uuid4   # makes random unique IDs
 # This "if" just handles two different ways the file can be run.
 # Either way, it loads create_tool_event from events.py.
 if __package__:
-    from .events import create_tool_event
+    from events import create_tool_event
 else:
     from events import create_tool_event
 
