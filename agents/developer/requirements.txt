@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+httpx
+google-genai
+pydantic
+python-dotenv
+pytest
+playwright

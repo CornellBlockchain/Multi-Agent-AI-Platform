@@ -2,7 +2,7 @@
 
 [Project overview](../README.md) · [Backend plan](../backend/README.md) · [Shared interface plan](../shared/README.md)
 
-**Status: planning only.** This folder contains this guide. No interface, assets, dependencies, build configuration, or development server is provided.
+**Status: first implementation.** A React + TypeScript + Tailwind dashboard with every view below, live polling, and a built-in demo backend for working without the API. It has not yet been connected to the real backend (Meeting 3).
 
 ## Goal & Ownership
 
@@ -16,9 +16,54 @@ Build a React + Tailwind dashboard that lets a user ask a question, follow both 
 4. Connect the actual backend and agent activity in Meeting 3.
 5. Check the deployed application before the joint presentation.
 
-No setup or build commands are available yet. Add those instructions after choosing dependencies and creating the implementation.
+Setup and build commands are under [Local Development](#local-development).
 
 **First working checkpoint:** Build a query form and two agent cards, then check waiting, running, and completed views with locally prepared data matching the shared fields. Confirm these views before adding polling and the full timeline.
+
+## Local Development
+
+Requires Node.js 20 or newer. Run everything from `frontend/`.
+
+```bash
+npm install
+npm run dev:mock     # demo backend in the browser, no API needed → http://localhost:5173
+npm run dev          # real API: proxies /api to BACKEND_URL (default http://localhost:8000)
+npm test             # unit tests: timeline grouping and polling behaviour
+npm run build        # type-check and build to frontend/dist
+```
+
+**Demo mode.** `npm run dev:mock`, or `?demo` on any URL (e.g. `http://localhost:5173/?demo=partial`), swaps in a scripted backend. The scenario chips under the form switch between *Completed*, *Partial*, *Failed*, *Planning fails*, and *Connection drops*. The scripts deliberately include a terminal event that arrives before its start event and a start event that only arrives with the agent's final result, so ordering handling is exercised. Demo runs are labelled on screen and never call real agents.
+
+**Configuration** (`.env.example`): `BACKEND_URL` sets the dev proxy target; `VITE_API_BASE` is only needed if the build is served from a different origin than the API. The dashboard holds no provider credentials.
+
+**Serving the build from FastAPI.** The build uses relative asset paths, so the backend can mount it after its API routes:
+
+```python
+from fastapi.staticfiles import StaticFiles
+
+# After all /api routes are registered:
+app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="dashboard")
+```
+
+### Code Layout
+
+| Path | Contents |
+| :--- | :--- |
+| `src/types.ts` | The shared contract as TypeScript types. Change field names here only. |
+| `src/api/client.ts` | HTTP client for `GET /api/health`, `POST /api/runs`, `GET /api/runs/{run_id}`; FastAPI error parsing. |
+| `src/api/mock.ts`, `mockScenarios.ts` | Demo backend and scripted runs. |
+| `src/lib/runFollower.ts` | Starts a run, polls the snapshot every second, stops on `completed`/`partial`/`failed`, ignores responses for superseded questions, keeps the last state and backs off when the connection drops. |
+| `src/lib/timeline.ts` | Groups events into one row per `(task_id, tool_call_id)`; merges events returned with agent results; de-duplicates by `event_id`; a terminal event always wins over a late start. |
+| `src/components/` | Query form, run header and workflow steps, agent lanes (card, assignment, activity, findings, sources, artifacts), combined answer. |
+
+### Contract Assumptions to Confirm with the Backend
+
+- Snapshots follow the **Run state** fields exactly; `agents` is keyed `research` / `developer`.
+- `final_answer` is rendered as Markdown (GitHub-flavoured, raw HTML ignored). Links in it open in a new tab.
+- Tool names such as `brave_search`, `github_search`, `python_execution` get display names in `src/lib/format.ts`; unknown names are made readable (`some_tool` becomes "Some tool").
+- A tool row still running when its agent or the run has finished is shown as **Stopped** ("No result reported"), not Failed. The backend should still send `tool.failed` for interrupted calls.
+- A gateway error (502/503/504) or an empty 5xx body is treated as "backend unreachable" and retried; a `404` for a run stops polling with an explanation (the backend may have restarted and cleared history).
+- Elapsed times compare server timestamps with the browser clock and are clamped at zero; large clock skew would show up there.
 
 ## Dashboard TODOs
 
@@ -75,12 +120,14 @@ Prepare the [shared handoff items](../shared/README.md#meeting-3-handoff) and re
 
 ## Finish Checklist
 
-- [ ] A submitted question shows two independent assignments.
-- [ ] Each agent's current tool and actual status are visible.
-- [ ] Tool-start messages appear before their final results.
-- [ ] Completion/failure updates the matching tool call.
+Items marked done are verified against the demo backend; they still need a pass against the real backend in Meeting 3.
+
+- [x] A submitted question shows two independent assignments.
+- [x] Each agent's current tool and actual status are visible.
+- [x] Tool-start messages appear before their final results.
+- [x] Completion/failure updates the matching tool call.
 - [ ] Sources, artifacts, and final answer match backend data.
-- [ ] Long content, narrow screens, keyboard access, and connection failures are checked.
+- [x] Long content, narrow screens, keyboard access, and connection failures are checked.
 - [ ] The integrated interface works on Akash in Meeting 3.
 
 ## Four-Meeting Milestones
