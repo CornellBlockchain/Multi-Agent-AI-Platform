@@ -111,6 +111,24 @@ def test_unknown_tool_fails_cleanly():
     assert_event_pair(ctx, "tool.failed")
 
 
+def test_search_limit_refuses_the_third_search_in_a_task(fake_github):
+    fake_github.routes["/search/repositories"] = json_response({"items": []})
+    ctx = new_ctx()
+    for _ in range(2):
+        assert "error" not in run(tools.run_tool("github_search", {"query": "x"}, ctx))
+
+    result = run(tools.run_tool("github_search", {"query": "x"}, ctx))
+
+    assert "Limit of 2 github_search calls" in result["error"]
+    assert len(fake_github.requests) == 2, "the refused search never reaches GitHub"
+    started, failed = ctx["events"][-2:]
+    assert (started["type"], failed["type"]) == ("tool.started", "tool.failed")
+    assert started["tool_call_id"] == failed["tool_call_id"]
+
+    _, fresh = call_tool("github_search", query="x")
+    assert_event_pair(fresh, "tool.completed")
+
+
 def test_unexpected_exception_hides_detail(monkeypatch, capsys):
     async def broken(**kwargs):
         raise RuntimeError("token ghp_SECRET leaked")
@@ -322,6 +340,50 @@ def test_repo_overview_missing_repo(fake_github):
 
 def test_repo_overview_bad_input_makes_no_request(fake_github):
     result, ctx = call_tool("repo_overview", repo="justaword")
+    assert_event_pair(ctx, "tool.failed")
+    assert fake_github.requests == []
+
+
+# A repo shaped like fastapi: the docs sort first and fill the file list.
+DOCS_FIRST = ([f"docs/page{i}.md" for i in range(tools.MAX_TREE_PATHS)]
+              + ["fastapi/params.py", "fastapi/dependencies/utils.py", "README.md"])
+
+
+def test_repo_overview_outline_shows_folders_the_file_list_cuts_off(fake_github):
+    overview_routes(fake_github, files=DOCS_FIRST)
+    result, _ = call_tool("repo_overview", repo="acme/app")
+
+    assert "fastapi/params.py" not in result["summary"], "the cap still hides it"
+    assert f"docs/ ({tools.MAX_TREE_PATHS} files)" in result["summary"]
+    assert "fastapi/ (2 files)" in result["summary"]
+    assert "path set to a folder" in result["summary"]
+
+
+def test_repo_overview_path_lists_one_folder(fake_github):
+    overview_routes(fake_github, files=DOCS_FIRST)
+    result, ctx = call_tool("repo_overview", repo="acme/app", path="/fastapi/")
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Inspected acme/app/fastapi (2 files)"
+    assert "fastapi/params.py" in result["summary"]
+    assert "fastapi/dependencies/ (1 files)" in result["summary"]
+    assert "docs/" not in result["summary"]
+    assert ctx["sources"] == [{"title": "acme/app/fastapi",
+                               "url": "https://github.com/acme/app/tree/main/fastapi"}]
+    assert not any(r.url.path.endswith("/readme") for r in fake_github.requests)
+
+
+def test_repo_overview_unknown_folder_fails(fake_github):
+    overview_routes(fake_github)
+    result, ctx = call_tool("repo_overview", repo="acme/app", path="nope")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "No folder 'nope'" in result["error"]
+
+
+def test_repo_overview_rejects_parent_path_without_a_request(fake_github):
+    result, ctx = call_tool("repo_overview", repo="acme/app", path="../secrets")
+
     assert_event_pair(ctx, "tool.failed")
     assert fake_github.requests == []
 

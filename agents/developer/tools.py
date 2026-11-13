@@ -4,6 +4,7 @@ import os
 import socket
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 import re
 from urllib.parse import urlsplit
@@ -107,6 +108,87 @@ async def github_search(query: str) -> dict:
         "artifacts": [],
     }
 
+MAX_TREE_PATHS = 300
+
+async def repo_overview(repo: str, path: str = "") -> dict:
+    repo = check_repo(repo)
+    path = path.strip().strip("/")
+    if ".." in path.split("/"):
+        raise ToolError(f"Invalid folder path '{path}'")
+
+    # metadata
+    info = (await github_get(f"/repos/{repo}")).json()
+    branch = info['default_branch']
+
+    # readme, for the whole repo only: a folder listing is a second look
+    readme = None
+    if not path:
+        try:
+            readme = (await github_get(f'/repos/{repo}/readme', raw = True)).text
+        except ToolError:
+            readme = "(no README)"
+
+    # default branch paths
+
+    tree = (await github_get(f'/repos/{repo}/git/trees/{branch}?recursive=1')).json()
+    files = [t["path"] for t in tree.get("tree", []) if t["type"] == "blob"]
+    prefix = f"{path}/" if path else ""
+    if path:
+        files = [f for f in files if f.startswith(prefix)]
+        if not files:
+            raise ToolError(f"No folder '{path}' in {repo}")
+
+    # In a big repo the first files are often all docs, which hides the code.
+    # The outline names every folder with its size, so Gemini can always see
+    # where the code is and list that folder with `path`.
+    folders = Counter(f[len(prefix):].split("/")[0] for f in files if "/" in f[len(prefix):])
+    outline = "\n".join(f"{prefix}{d}/ ({n} files)" for d, n in sorted(folders.items()))
+    shown = files[:MAX_TREE_PATHS]
+    more = (f"\n... {len(files) - len(shown)} more files; call repo_overview again with "
+            "path set to a folder above to list it" if len(files) > len(shown) else "")
+
+    url = info['html_url']
+    target = f"{repo}/{path}" if path else repo
+    return{
+    "message": f"Inspected {target} ({len(files)} files)",
+        "summary": (
+            f"{repo}: {info.get('description') or 'no description'}\n"
+            f"{info['stargazers_count']} stars, language {info.get('language') or 'n/a'}, "
+            f"default branch {branch}.\n\n"
+            + (f"README (start):\n{readme[:3000]}\n\n" if readme else "")
+            + (f"Folders:\n{outline}\n\n" if outline else "")
+            + f"Files{f' in {path}/' if path else ''}:\n" + "\n".join(shown) + more
+        ),
+        "sources": [{"title": target, "url": f"{url}/tree/{branch}/{path}"}] if path else [
+            {"title": repo, "url": url},
+            {"title": f"{repo} README", "url": f"{url}#readme"},
+        ],
+        "artifacts": [{"name": f"{target} file tree", "content": "\n".join(shown) + more}]
+    }
+
+MAX_FILE_CHARS = 12_000
+
+async def read_repo_file(repo: str, path: str) -> dict:
+    repo = check_repo(repo)
+    path = path.strip().lstrip("/")
+    if not path or ".." in path.split("/"):
+        raise ToolError(f"Invalid file path '{path}'")
+
+    r = await github_get(f"/repos/{repo}/contents/{path}", raw=True)
+    if r.headers.get("content-type", "").startswith("application/json"):
+        raise ToolError(f"'{path}' is a directory, not a file")
+
+    text = r.text
+    truncated = len(text) > MAX_FILE_CHARS
+    text = text[:MAX_FILE_CHARS]
+
+    return {
+        "message": f"Read {path}" + (" (truncated)" if truncated else ""),
+        "summary": text,
+        "sources": [{"title": f"{repo}/{path}", "url": f"https://github.com/{repo}/blob/HEAD/{path}"}],
+        "artifacts": [{"name": f"{repo}/{path}", "content": text}],
+    }
+
 async def check_public_url(url: str) -> None:
     """Refuse anything but http(s) to a public address.
 
@@ -194,7 +276,11 @@ async def playwright_browse(url: str) -> dict:
     }
 
 TOOLS = {
-    "github_search": {"fn": github_search, "start": "Searching GitHub"},
+    # limit: calls allowed per task. flash-lite ignores the prompt's "search once
+    # or twice" and spends every turn searching; a refusal makes it move on.
+    "github_search": {"fn": github_search, "start": "Searching GitHub", "limit": 2},
+    "repo_overview": {"fn": repo_overview, "start": "Inspecting repository"},
+    "read_repo_file": {"fn": read_repo_file, "start": "Reading repository file"},
     "playwright_browse": {"fn": playwright_browse, "start": "Opening page"},
 }
 
@@ -213,6 +299,29 @@ TOOL_DECLARATIONS = [
             },
             "required": ["query"],
         },
+    ),
+    types.FunctionDeclaration(
+        name="repo_overview",
+        description="Inspect one GitHub repository: description, stars, language, README, "
+                    "its folders with file counts, and its file tree. Use after github_search "
+                    "to look inside a result, and to find file paths for read_repo_file. Large "
+                    "repos list only some files: if the code you need isn't listed, call this "
+                    "again with path set to the folder that holds it.",
+        parameters={"type": "OBJECT", "properties": {
+            "repo": {"type": "STRING", "description": "owner/name, e.g. 'duckdb/duckdb'"},
+            "path": {"type": "STRING",
+                     "description": "optional folder to list, taken from the folder outline, "
+                                    "e.g. 'fastapi' or 'src/main'"},
+        }, "required": ["repo"]},
+    ),
+    types.FunctionDeclaration(
+        name="read_repo_file",
+        description="Read the source of one file in a GitHub repository. Use a path "
+                    "taken from repo_overview's file tree, not a guessed one.",
+        parameters={"type": "OBJECT", "properties": {
+            "repo": {"type": "STRING", "description": "owner/name"},
+            "path": {"type": "STRING", "description": "file path, e.g. 'fastapi/routing.py'"},
+        }, "required": ["repo", "path"]},
     ),
     types.FunctionDeclaration(
         name="playwright_browse",
@@ -240,6 +349,10 @@ async def run_tool(name, args, ctx):
     try:
         if tool is None:
             raise ToolError(f"Unknown tool '{name}'")
+        calls = sum(e["type"] == "tool.started" and e["tool"] == name for e in ctx["events"])
+        if calls > tool.get("limit", calls):
+            raise ToolError(f"Limit of {tool['limit']} {name} calls reached for this task. "
+                            "Inspect a result you already have, or answer from what you found.")
         result = await tool["fn"](**args)
     except Exception as e:
         ms = round((time.perf_counter() - start) * 1000)
