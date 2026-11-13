@@ -21,6 +21,7 @@ import inspect
 import os
 import shutil
 
+import duckdb
 import httpx
 import pytest
 from dotenv import load_dotenv
@@ -448,6 +449,168 @@ def test_read_repo_file_rejects_bad_paths_without_a_request(fake_github, path):
     assert_event_pair(ctx, "tool.failed")
     assert "Invalid file path" in result["error"]
     assert fake_github.requests == []
+
+
+# --- duckdb_query ------------------------------------------------------------------
+
+@pytest.fixture
+def tiny_repos(monkeypatch, tmp_path):
+    """Point duckdb_query at a three-repo snapshot written for the test."""
+    path = tmp_path / "repos.parquet"
+    con = duckdb.connect()
+    con.execute(f"""COPY (SELECT * FROM (VALUES
+        ('a/one', 'First', 'Python', 300, 'MIT', ['llm']),
+        ('b/two', 'Second', 'Python', 100, NULL, []),
+        ('c/three', NULL, 'Rust', 200, 'MIT', ['cli', 'llm'])
+    ) t(full_name, description, language, stars, license, topics)) TO '{path}' (FORMAT parquet)""")
+    con.close()
+    monkeypatch.setattr(tools, "REPOS_PARQUET", path)
+    return tmp_path
+
+
+def test_duckdb_query_aggregates(tiny_repos):
+    result, ctx = call_tool("duckdb_query",
+                            sql="SELECT language, count(*) AS n FROM repos GROUP BY language ORDER BY n DESC")
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Query returned 2 rows"
+    assert result["summary"].startswith("2 rows. Columns: language, n")
+    assert "Python | 2" in result["summary"]
+    assert ctx["sources"] == [{"title": f"GitHub repos snapshot {tools.REPOS_SNAPSHOT}", "url": None}]
+    assert ctx["artifacts"][0]["content"] == "language,n\nPython,2\nRust,1\n"
+
+
+def test_duckdb_query_reads_lists_and_nulls(tiny_repos):
+    result, _ = call_tool("duckdb_query",
+                          sql="SELECT full_name, description FROM repos WHERE list_contains(topics, 'cli')")
+    assert "c/three | NULL" in result["summary"]
+
+
+def test_duckdb_query_caps_rows(tiny_repos):
+    result, _ = call_tool("duckdb_query", sql=f"SELECT * FROM range({tools.MAX_QUERY_ROWS + 25})")
+
+    assert result["message"] == f"Query returned {tools.MAX_QUERY_ROWS + 25} rows"
+    assert result["summary"].startswith(f"First {tools.MAX_QUERY_ROWS} of {tools.MAX_QUERY_ROWS + 25} rows")
+    assert result["artifacts"][0]["content"].count("\n") == tools.MAX_QUERY_ROWS + 1  # header + rows
+
+
+def test_duckdb_query_caps_cell_text(tiny_repos):
+    result, _ = call_tool("duckdb_query", sql="SELECT repeat('x', 5000) AS long")
+    assert "x" * tools.MAX_CELL_CHARS + "..." in result["summary"]
+    assert "x" * (tools.MAX_CELL_CHARS + 1) not in result["summary"]
+
+
+@pytest.mark.parametrize("sql", ["", "   "])
+def test_duckdb_query_empty_sql_opens_nothing(monkeypatch, sql):
+    monkeypatch.setattr(tools.duckdb, "connect", lambda *a, **kw: pytest.fail("connected"))
+    result, ctx = call_tool("duckdb_query", sql=sql)
+
+    assert_event_pair(ctx, "tool.failed")
+    assert result["error"] == "Empty SQL query"
+
+
+def test_duckdb_query_bad_sql_shows_duckdb_message(tiny_repos):
+    result, ctx = call_tool("duckdb_query", sql="SELECT nope FROM repos")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert result["error"].startswith("DuckDB: Binder Error")
+    assert "nope" in result["error"]
+
+
+def test_duckdb_query_one_statement_only(tiny_repos):
+    result, _ = call_tool("duckdb_query", sql="SELECT 1; SELECT 2")
+    assert result["error"] == "Send exactly one SQL statement"
+
+
+@pytest.mark.parametrize("sql", [
+    "DROP TABLE repos",
+    "INSERT INTO repos (full_name) VALUES ('x/y')",
+    "CREATE TABLE t AS SELECT 1",
+    "COPY repos TO 'out.csv'",
+    "ATTACH 'other.db'",
+    "INSTALL httpfs",
+    "LOAD httpfs",
+    "SET enable_external_access = true",
+    "PRAGMA enable_profiling",
+])
+def test_duckdb_query_refuses_anything_but_reads(tiny_repos, sql):
+    result, ctx = call_tool("duckdb_query", sql=sql)
+
+    assert_event_pair(ctx, "tool.failed")
+    assert result["error"].startswith("Only read queries are allowed")
+    assert sorted(p.name for p in tiny_repos.iterdir()) == ["repos.parquet"]
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM read_csv('{f}')",
+    "SELECT * FROM '{f}'",
+    "SELECT * FROM read_text('{f}')",
+    "SELECT * FROM glob('{d}/*')",
+])
+def test_duckdb_query_cannot_read_files(tiny_repos, sql):
+    secret = tiny_repos / "secret.csv"
+    secret.write_text("token\nghp_SECRET\n")
+    result, ctx = call_tool("duckdb_query", sql=sql.format(f=secret, d=tiny_repos))
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "Permission Error" in result["error"]
+    assert "ghp_SECRET" not in str(result)
+
+
+@pytest.mark.parametrize("sql", [
+    "COPY repos TO '{d}/out.csv'",
+    "ATTACH '{d}/other.db'",
+    "INSTALL httpfs",
+    "LOAD httpfs",
+    "SET enable_external_access = true",
+    "SET lock_configuration = false",
+])
+def test_duckdb_locked_even_past_the_statement_check(tiny_repos, sql):
+    """Second line of defence: had a write slipped past the type check, DuckDB still refuses it."""
+    con = duckdb.connect()
+    tools.open_repos_db(con)
+    with pytest.raises(duckdb.Error):
+        con.execute(sql.format(d=tiny_repos))
+    assert sorted(p.name for p in tiny_repos.iterdir()) == ["repos.parquet"]
+
+
+def test_duckdb_query_timeout_interrupts(tiny_repos, monkeypatch):
+    real_connect = duckdb.connect
+    spies = []
+
+    class Spy:
+        def __init__(self):
+            self.con = real_connect()
+            self.interrupted = False
+            spies.append(self)
+
+        def interrupt(self):
+            self.interrupted = True
+            self.con.interrupt()
+
+        def __getattr__(self, name):
+            return getattr(self.con, name)
+
+    monkeypatch.setattr(tools.duckdb, "connect", lambda *a, **kw: Spy())
+    monkeypatch.setattr(tools, "QUERY_TIMEOUT_S", 0.5)
+    result, ctx = call_tool("duckdb_query",
+                            sql="SELECT count(*) FROM range(100000000000) WHERE range % 7 = 3")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "took longer than 0.5 s" in result["error"]
+    assert spies[0].interrupted  # and the test only finishes because the worker thread stopped
+
+
+def test_duckdb_real_snapshot_loads():
+    assert tools.REPOS_PARQUET.exists(), "run data/build_repos.py"
+    result, ctx = call_tool("duckdb_query", sql="DESCRIBE repos")
+
+    assert_event_pair(ctx, "tool.completed")
+    columns = [line.split(" | ")[0] for line in result["summary"].splitlines()[3:]]
+    assert columns == ["full_name", "description", "language", "stars", "forks", "open_issues",
+                       "license", "topics", "created_at", "pushed_at", "archived", "html_url"]
+    description = DECLARED["duckdb_query"].description
+    assert all(c in description for c in columns), "Gemini must be told every column"
 
 
 @pytest.mark.live

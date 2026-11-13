@@ -1,4 +1,6 @@
 import asyncio
+import csv
+import io
 import ipaddress
 import os
 import socket
@@ -6,9 +8,11 @@ import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
+import duckdb
 import httpx
 
 from google.genai import types
@@ -390,6 +394,79 @@ async def run_cpp(code: str) -> dict:
         "artifacts": artifacts,
     }
 
+# Rebuild with data/build_repos.py, then update this date.
+REPOS_SNAPSHOT = "2026-11-13"
+REPOS_PARQUET = Path(__file__).parent / "data" / f"github_repos_{REPOS_SNAPSHOT}.parquet"
+QUERY_TIMEOUT_S = 10
+MAX_QUERY_ROWS = 50
+MAX_CELL_CHARS = 200
+
+def open_repos_db(con) -> None:
+    """Load the snapshot into table `repos`, then shut every door out of DuckDB.
+
+    The SQL comes from Gemini, and page text can steer Gemini, so after loading
+    the query must not reach files, the network, extensions or settings.
+    """
+    con.execute("CREATE TABLE repos AS SELECT * FROM read_parquet(?)", [str(REPOS_PARQUET)])
+    con.execute("SET python_enable_replacements = false")  # no reading Python variables as tables
+    con.execute("SET memory_limit = '512MB'")
+    con.execute("SET enable_external_access = false")
+    con.execute("SET lock_configuration = true")
+
+def run_query(con, sql: str):
+    """Runs in a worker thread. Returns (columns, first MAX_QUERY_ROWS rows, total row count)."""
+    try:
+        statements = con.extract_statements(sql)
+        if len(statements) != 1:
+            raise ToolError("Send exactly one SQL statement")
+        if statements[0].type != duckdb.StatementType.SELECT:
+            raise ToolError("Only read queries are allowed (SELECT, WITH, DESCRIBE, SUMMARIZE, SHOW)")
+        open_repos_db(con)
+        cursor = con.execute(sql)
+        columns = [d[0] for d in cursor.description]
+        rows = cursor.fetchmany(MAX_QUERY_ROWS)
+        total = len(rows)
+        while chunk := cursor.fetchmany(10_000):
+            total += len(chunk)  # count the rest without keeping it
+        return columns, rows, total
+    except duckdb.Error as e:
+        raise ToolError(f"DuckDB: {e}")  # about the query, so Gemini can fix it
+    finally:
+        con.close()
+
+def cell(value) -> str:
+    text = "NULL" if value is None else str(value)
+    return text if len(text) <= MAX_CELL_CHARS else text[:MAX_CELL_CHARS] + "..."
+
+async def duckdb_query(sql: str) -> dict:
+    """
+    Run one read-only SQL query against the GitHub repos snapshot
+    Can adjust MAX_QUERY_ROWS to send more or fewer rows to Gemini
+    """
+    sql = sql.strip()
+    if not sql:
+        raise ToolError("Empty SQL query")
+
+    con = duckdb.connect()
+    try:
+        columns, rows, total = await asyncio.wait_for(asyncio.to_thread(run_query, con, sql), QUERY_TIMEOUT_S)
+    except TimeoutError:
+        # ponytail: an interrupt landing between the load and the query is lost; fine while loading takes ms
+        con.interrupt()  # the worker thread then stops and closes the connection
+        raise ToolError(f"Query took longer than {QUERY_TIMEOUT_S} s and was stopped")
+
+    table = [[cell(c) for c in columns]] + [[cell(v) for v in row] for row in rows]
+    shown = f"first {len(rows)} of {total} rows" if total > len(rows) else f"{total} rows"
+    out = io.StringIO()
+    csv.writer(out, lineterminator="\n").writerows(table)
+    return {
+        "message": f"Query returned {total} rows",
+        "summary": f"{shown.capitalize()}. Columns: {', '.join(table[0])}\n\n"
+                   + "\n".join(" | ".join(r) for r in table),
+        "sources": [{"title": f"GitHub repos snapshot {REPOS_SNAPSHOT}", "url": None}],
+        "artifacts": [{"name": f"Query result ({shown})", "content": out.getvalue()}],
+    }
+
 TOOLS = {
     # limit: calls allowed per task. flash-lite ignores the prompt's "search once
     # or twice" and spends every turn searching; a refusal makes it move on.
@@ -398,6 +475,7 @@ TOOLS = {
     "read_repo_file": {"fn": read_repo_file, "start": "Reading repository file"},
     "playwright_browse": {"fn": playwright_browse, "start": "Opening page"},
     "run_cpp": {"fn": run_cpp, "start": "Compiling C++"},
+    "duckdb_query": {"fn": duckdb_query, "start": "Querying DuckDB"},
 }
 
 TOOL_DECLARATIONS = [
@@ -463,6 +541,26 @@ TOOL_DECLARATIONS = [
         parameters={"type": "OBJECT", "properties": {
             "code": {"type": "STRING", "description": "complete C++ source with a main() function"},
         }, "required": ["code"]},
+    ),
+    types.FunctionDeclaration(
+        name="duckdb_query",
+        description=f"Run one read-only DuckDB SQL query (a single SELECT, WITH, DESCRIBE, "
+                    f"SUMMARIZE or SHOW statement) on table repos: a {REPOS_SNAPSHOT} snapshot of "
+                    "about 1,700 popular public GitHub repositories. Not a random sample: it is the "
+                    "top 300 by stars plus the top 100 for each of 13 languages and 6 topics (llm, "
+                    "machine-learning, deep-learning, blockchain, ethereum, web3). Use it for counts, "
+                    "rankings and medians across repositories. Columns: full_name VARCHAR "
+                    "('owner/name'), description VARCHAR, language VARCHAR (main language, may be "
+                    "NULL), stars INTEGER, forks INTEGER, open_issues INTEGER (issues plus pull "
+                    "requests), license VARCHAR (SPDX id such as 'MIT'; 'NOASSERTION' for an "
+                    "unrecognised license, NULL for none), topics VARCHAR[] (filter with "
+                    "list_contains(topics, 'llm')), created_at TIMESTAMP (UTC), pushed_at TIMESTAMP "
+                    f"(UTC, last push), archived BOOLEAN, html_url VARCHAR. Returns the column names "
+                    f"and at most {MAX_QUERY_ROWS} rows, so aggregate or use LIMIT.",
+        parameters={"type": "OBJECT", "properties": {
+            "sql": {"type": "STRING", "description": "One DuckDB SQL statement, e.g. "
+                    "'SELECT language, count(*) AS n FROM repos GROUP BY language ORDER BY n DESC'"},
+        }, "required": ["sql"]},
     ),
 ]
 
