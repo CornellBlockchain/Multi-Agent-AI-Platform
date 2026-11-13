@@ -255,11 +255,127 @@ async def playwright_browse(url: str) -> dict:
         "artifacts": [{"name": f"Page text: {title}", "content": text[:MAX_PAGE_CHARS]}],
     }
 
+CPP_COMPILE_TIMEOUT_S = 20
+CPP_RUN_TIMEOUT_S = 10
+# Backstop for a sandbox that hangs (slow daemon, stuck container); the
+# in-container timeouts above should always fire first.
+CPP_SANDBOX_TIMEOUT_S = CPP_COMPILE_TIMEOUT_S + CPP_RUN_TIMEOUT_S + 15
+MAX_CPP_OUTPUT_CHARS = 4_000
+CPP_MARKER = b"\n@@cpp "
+
+# Runs inside the container. The source arrives on stdin; compiler output goes
+# to stderr, program output (stdout and stderr) to stdout, and the last stderr
+# line reports both exit codes. Outputs go through files on the size-capped
+# /tmp so a program printing forever cannot flood this process.
+CPP_SCRIPT = f"""cat > /tmp/main.cpp
+timeout -k 1 {CPP_COMPILE_TIMEOUT_S} g++ -std=c++17 -O2 -o /tmp/main /tmp/main.cpp > /tmp/compile.txt 2>&1
+c=$?
+head -c {MAX_CPP_OUTPUT_CHARS + 1} /tmp/compile.txt >&2
+r=-1
+if [ $c -eq 0 ]; then
+  # The group's 2>/dev/null drops the shell's own "Segmentation fault" notice,
+  # which would otherwise land in the compiler output; the exit code keeps it.
+  {{ timeout -k 1 {CPP_RUN_TIMEOUT_S} /tmp/main < /dev/null > /tmp/out.txt 2>&1; r=$?; }} 2>/dev/null
+  head -c {MAX_CPP_OUTPUT_CHARS + 1} /tmp/out.txt
+fi
+printf '\\n@@cpp compile=%s run=%s\\n' "$c" "$r" >&2
+"""
+
+def clip_output(raw: bytes) -> tuple[str, bool]:
+    """Decode captured output, cut to MAX_CPP_OUTPUT_CHARS. Returns (text, truncated)."""
+    return raw[:MAX_CPP_OUTPUT_CHARS].decode("utf-8", errors="replace"), len(raw) > MAX_CPP_OUTPUT_CHARS
+
+async def run_cpp(code: str) -> dict:
+    """
+    Compile and run one C++17 program in a throwaway Docker container
+    No network, capped memory/cpu/processes, read-only except a small /tmp
+    """
+    if not code.strip():
+        raise ToolError("No C++ code was given")
+
+    docker = os.getenv("DOCKER_BIN", "docker")
+    image = os.getenv("CPP_SANDBOX_IMAGE", "gcc:14")
+    name = f"cpp-{uuid.uuid4().hex[:12]}"
+    argv = [
+        docker, "run", "--rm", "-i", "--name", name, "--pull", "never",
+        "--network", "none", "--memory", "256m", "--cpus", "1", "--pids-limit", "64",
+        "--read-only", "--tmpfs", "/tmp:rw,exec,size=64m",
+        "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--user", "65534:65534",
+        image, "sh", "-c", CPP_SCRIPT,
+    ]
+
+    start = time.perf_counter()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        raise ToolError("Docker is not available, so C++ cannot be run here")
+
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(code.encode()), timeout=CPP_SANDBOX_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        # Killing the docker CLI leaves the container running; kill it by name.
+        killer = await asyncio.create_subprocess_exec(
+            docker, "kill", name, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await killer.wait()
+        proc.kill()
+        await proc.wait()
+        raise ToolError(f"The C++ sandbox did not finish within {CPP_SANDBOX_TIMEOUT_S} s and was stopped")
+    seconds = time.perf_counter() - start
+
+    compiler_raw, found, status = err.rpartition(CPP_MARKER)
+    m = re.match(rb"compile=(\d+) run=(-?\d+)", status)
+    if not found or not m:
+        # Docker's own text is not ours to display; keep it in the log.
+        print(f"[error] run_cpp docker exit {proc.returncode}: {err.decode(errors='replace')[-500:]}", flush=True)
+        if b"Unable to find image" in err or b"No such image" in err:
+            raise ToolError(f"The C++ sandbox image {image} is not pulled (run: docker pull {image})")
+        raise ToolError(f"The C++ sandbox could not run the program (docker exit {proc.returncode})")
+
+    compile_code, run_code = int(m[1]), int(m[2])
+    compiler_out, compiler_cut = clip_output(compiler_raw)
+    program_out, program_cut = clip_output(out)
+    compiled = compile_code == 0
+    timed_out = run_code == 124  # what timeout(1) exits with when the limit hits
+
+    if not compiled:
+        message = "Compilation timed out" if compile_code == 124 else "Compilation failed"
+        exit_text = "not run"
+    elif timed_out:
+        message = f"Program timed out after {CPP_RUN_TIMEOUT_S} s"
+        exit_text = "none (timed out)"
+    else:
+        message = f"Execution completed (exit {run_code})"
+        exit_text = str(run_code) + (f" (killed by signal {run_code - 128})" if run_code > 128 else "")
+
+    cut = f" (truncated to {MAX_CPP_OUTPUT_CHARS} chars)"
+    artifacts = []
+    if compiler_out.strip():
+        artifacts.append({"name": "C++ compiler output", "content": compiler_out})
+    if compiled and program_out:
+        artifacts.append({"name": "C++ program output", "content": program_out})
+    return {
+        "message": message,
+        "summary": (
+            f"Compiled: {'yes' if compiled else 'no'}. Exit status: {exit_text}. "
+            f"Timed out: {'yes' if timed_out or compile_code == 124 else 'no'}. "
+            f"Duration: {seconds:.2f} s (container start, compile and run).\n\n"
+            f"Compiler output{cut if compiler_cut else ''}:\n{compiler_out.strip() or '(none)'}\n\n"
+            f"Program output{cut if program_cut else ''}:\n"
+            + ((program_out or "(none)") if compiled else "(not run)")
+        ),
+        "sources": [],
+        "artifacts": artifacts,
+    }
+
 TOOLS = {
     "github_search": {"fn": github_search, "start": "Searching GitHub"},
     "repo_overview": {"fn": repo_overview, "start": "Inspecting repository"},
     "read_repo_file": {"fn": read_repo_file, "start": "Reading repository file"},
     "playwright_browse": {"fn": playwright_browse, "start": "Opening page"},
+    "run_cpp": {"fn": run_cpp, "start": "Compiling C++"},
 }
 
 TOOL_DECLARATIONS = [
@@ -310,6 +426,16 @@ TOOL_DECLARATIONS = [
             },
             "required": ["url"],
         },
+    ),
+    types.FunctionDeclaration(
+        name="run_cpp",
+        description="Compile and run one single-file C++17 program (g++ -O2) in an isolated "
+                    "sandbox: no network, no stdin, time-limited. Returns whether it compiled, "
+                    "compiler output, program output, exit status and duration. Use it to "
+                    "actually run code rather than guessing what it outputs.",
+        parameters={"type": "OBJECT", "properties": {
+            "code": {"type": "STRING", "description": "complete C++ source with a main() function"},
+        }, "required": ["code"]},
     ),
 ]
 

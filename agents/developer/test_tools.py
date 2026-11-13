@@ -19,6 +19,7 @@ automatically.
 import asyncio
 import inspect
 import os
+import shutil
 
 import httpx
 import pytest
@@ -393,6 +394,204 @@ def test_live_read_repo_file():
     result, ctx = call_tool("read_repo_file", repo="fastapi/fastapi", path="README.md")
     assert_event_pair(ctx, "tool.completed")
     assert "FastAPI" in result["summary"]
+
+
+# --- run_cpp -----------------------------------------------------------------------
+#
+# Docker is faked: `fake_docker` replaces asyncio.create_subprocess_exec, so the
+# real tool code builds the command and parses the sandbox's output. The sample
+# programs in samples/cpp/ are the inputs. With Docker installed and the image
+# pulled (docker pull gcc:14), `python -m pytest -m live -k run_cpp` runs one for real.
+
+SAMPLES = os.path.join(os.path.dirname(__file__), "samples", "cpp")
+
+
+def sample(name):
+    with open(os.path.join(SAMPLES, name), encoding="utf-8") as f:
+        return f.read()
+
+
+class FakeProcess:
+    def __init__(self, stdout=b"", stderr=b"", returncode=0, hang=False):
+        self.stdout, self.stderr, self.returncode, self.hang = stdout, stderr, returncode, hang
+        self.input = None
+        self.killed = False
+
+    async def communicate(self, input=None):
+        self.input = input
+        if self.hang:
+            await asyncio.sleep(3600)
+        return self.stdout, self.stderr
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.fixture
+def fake_docker(monkeypatch):
+    """Answer each subprocess call with the next FakeProcess in `.processes`.
+
+    `.answer(...)` queues what the container prints: program output on stdout,
+    compiler output on stderr, then the status line. Each call's argv is
+    recorded in `.calls`; extra calls (docker kill) get an empty process.
+    """
+    class Fake:
+        def answer(self, compile=0, run=0, compiler=b"", program=b""):
+            status = b"\n@@cpp compile=%d run=%d\n" % (compile, run)
+            self.processes.append(FakeProcess(program, compiler + status))
+
+    fake = Fake()
+    fake.calls, fake.processes = [], []
+
+    async def fake_exec(*argv, **kwargs):
+        fake.calls.append(list(argv))
+        return fake.processes.pop(0) if fake.processes else FakeProcess()
+
+    monkeypatch.setattr(tools.asyncio, "create_subprocess_exec", fake_exec)
+    return fake
+
+
+def test_run_cpp_success(fake_docker):
+    fake_docker.answer(program=b"Hello from C++\nsum 1..10 = 55\n")
+    result, ctx = call_tool("run_cpp", code=sample("hello.cpp"))
+
+    assert_event_pair(ctx, "tool.completed")
+    assert ctx["events"][0]["message"] == "Compiling C++"
+    assert result["message"] == "Execution completed (exit 0)"
+    assert "Compiled: yes. Exit status: 0. Timed out: no." in result["summary"]
+    assert "sum 1..10 = 55" in result["summary"]
+    assert ctx["sources"] == []
+    assert ctx["artifacts"] == [{"name": "C++ program output", "content": "Hello from C++\nsum 1..10 = 55\n"}]
+
+
+def test_run_cpp_sandbox_flags_and_code_on_stdin(fake_docker, monkeypatch):
+    monkeypatch.delenv("CPP_SANDBOX_IMAGE", raising=False)
+    fake_docker.answer()
+    proc = fake_docker.processes[0]
+    code = sample("hello.cpp")
+    call_tool("run_cpp", code=code)
+
+    argv = fake_docker.calls[0]
+    joined = " ".join(argv)
+    assert argv[:3] == ["docker", "run", "--rm"]
+    for flag in ["--network none", "--memory 256m", "--cpus 1", "--pids-limit 64", "--read-only",
+                 "--cap-drop ALL", "--security-opt no-new-privileges", "gcc:14 sh -c"]:
+        assert flag in joined
+    assert not any("Hello from C++" in a for a in argv), "code must go on stdin, not argv"
+    assert proc.input == code.encode()
+
+
+def test_run_cpp_image_can_be_overridden(fake_docker, monkeypatch):
+    monkeypatch.setenv("CPP_SANDBOX_IMAGE", "gcc:13")
+    fake_docker.answer()
+    call_tool("run_cpp", code=sample("hello.cpp"))
+    assert "gcc:13" in fake_docker.calls[0]
+
+
+def test_run_cpp_compile_error_is_a_result(fake_docker):
+    fake_docker.answer(compile=1, run=-1,
+                       compiler=b"main.cpp:5:18: error: 'count' was not declared in this scope")
+    result, ctx = call_tool("run_cpp", code=sample("compile_error.cpp"))
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Compilation failed"
+    assert "Compiled: no. Exit status: not run." in result["summary"]
+    assert "'count' was not declared" in result["summary"]
+    assert [a["name"] for a in ctx["artifacts"]] == ["C++ compiler output"]
+
+
+def test_run_cpp_runtime_crash_is_a_result(fake_docker):
+    fake_docker.answer(run=134, program=b"about to read v[5]\nterminate called after throwing an instance "
+                                        b"of 'std::out_of_range'\n")
+    result, ctx = call_tool("run_cpp", code=sample("runtime_error.cpp"))
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Execution completed (exit 134)"
+    assert "Exit status: 134 (killed by signal 6)" in result["summary"]
+    assert "out_of_range" in result["summary"]
+
+
+def test_run_cpp_nonzero_exit(fake_docker):
+    fake_docker.answer(run=3)
+    result, _ = call_tool("run_cpp", code="int main() { return 3; }")
+    assert "Exit status: 3." in result["summary"]
+    assert "Program output:\n(none)" in result["summary"]
+
+
+def test_run_cpp_program_timeout_is_a_result(fake_docker):
+    fake_docker.answer(run=124)
+    result, ctx = call_tool("run_cpp", code=sample("infinite_loop.cpp"))
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == f"Program timed out after {tools.CPP_RUN_TIMEOUT_S} s"
+    assert "Timed out: yes" in result["summary"]
+
+
+def test_run_cpp_hung_sandbox_is_killed_by_name(fake_docker, monkeypatch):
+    monkeypatch.setattr(tools, "CPP_SANDBOX_TIMEOUT_S", 0.05)
+    hung = FakeProcess(hang=True)
+    fake_docker.processes.append(hung)
+    result, ctx = call_tool("run_cpp", code=sample("infinite_loop.cpp"))
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "did not finish" in result["error"]
+    run_argv, kill_argv = fake_docker.calls
+    name = run_argv[run_argv.index("--name") + 1]
+    assert kill_argv == ["docker", "kill", name], "killing the CLI alone leaves the container running"
+    assert hung.killed
+
+
+def test_run_cpp_truncates_long_output(fake_docker):
+    fake_docker.answer(program=b"x" * (tools.MAX_CPP_OUTPUT_CHARS + 1))
+    result, ctx = call_tool("run_cpp", code="int main() {}")
+
+    assert f"Program output (truncated to {tools.MAX_CPP_OUTPUT_CHARS} chars)" in result["summary"]
+    assert len(ctx["artifacts"][0]["content"]) == tools.MAX_CPP_OUTPUT_CHARS
+
+
+def test_run_cpp_empty_code_starts_nothing(fake_docker):
+    result, ctx = call_tool("run_cpp", code="   ")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "No C++ code" in result["error"]
+    assert fake_docker.calls == []
+
+
+def test_run_cpp_without_docker(monkeypatch):
+    async def missing(*argv, **kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(tools.asyncio, "create_subprocess_exec", missing)
+    result, ctx = call_tool("run_cpp", code=sample("hello.cpp"))
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "Docker is not available" in result["error"]
+
+
+@pytest.mark.parametrize("stderr, expected", [
+    (b"Unable to find image 'gcc:14' locally\n", "not pulled"),
+    (b"docker: Error response from daemon: secret detail\n", "could not run the program (docker exit 125)"),
+])
+def test_run_cpp_docker_failure(fake_docker, capsys, stderr, expected):
+    fake_docker.processes.append(FakeProcess(stderr=stderr, returncode=125))
+    result, ctx = call_tool("run_cpp", code=sample("hello.cpp"))
+
+    assert_event_pair(ctx, "tool.failed")
+    assert expected in result["error"]
+    assert "secret detail" not in result["error"]
+    assert stderr.decode().strip() in capsys.readouterr().out, "docker's text must still reach the log"
+
+
+@pytest.mark.live
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker not installed")
+def test_live_run_cpp():
+    """Needs Docker and the image pulled first:  docker pull gcc:14"""
+    result, ctx = call_tool("run_cpp", code=sample("hello.cpp"))
+    assert_event_pair(ctx, "tool.completed")
+    assert "sum 1..10 = 55" in result["summary"]
 
 
 # --- Registry wiring (checks every tool automatically) -------------------------------
