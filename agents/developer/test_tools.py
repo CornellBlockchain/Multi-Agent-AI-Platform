@@ -19,7 +19,10 @@ automatically.
 import asyncio
 import inspect
 import os
+import shutil
+from types import SimpleNamespace
 
+import duckdb
 import httpx
 import pytest
 from dotenv import load_dotenv
@@ -109,6 +112,24 @@ def test_unknown_tool_fails_cleanly():
     result, ctx = call_tool("does_not_exist")
     assert "error" in result
     assert_event_pair(ctx, "tool.failed")
+
+
+def test_search_limit_refuses_the_third_search_in_a_task(fake_github):
+    fake_github.routes["/search/repositories"] = json_response({"items": []})
+    ctx = new_ctx()
+    for _ in range(2):
+        assert "error" not in run(tools.run_tool("github_search", {"query": "x"}, ctx))
+
+    result = run(tools.run_tool("github_search", {"query": "x"}, ctx))
+
+    assert "Limit of 2 github_search calls" in result["error"]
+    assert len(fake_github.requests) == 2, "the refused search never reaches GitHub"
+    started, failed = ctx["events"][-2:]
+    assert (started["type"], failed["type"]) == ("tool.started", "tool.failed")
+    assert started["tool_call_id"] == failed["tool_call_id"]
+
+    _, fresh = call_tool("github_search", query="x")
+    assert_event_pair(fresh, "tool.completed")
 
 
 def test_unexpected_exception_hides_detail(monkeypatch, capsys):
@@ -326,6 +347,50 @@ def test_repo_overview_bad_input_makes_no_request(fake_github):
     assert fake_github.requests == []
 
 
+# A repo shaped like fastapi: the docs sort first and fill the file list.
+DOCS_FIRST = ([f"docs/page{i}.md" for i in range(tools.MAX_TREE_PATHS)]
+              + ["fastapi/params.py", "fastapi/dependencies/utils.py", "README.md"])
+
+
+def test_repo_overview_outline_shows_folders_the_file_list_cuts_off(fake_github):
+    overview_routes(fake_github, files=DOCS_FIRST)
+    result, _ = call_tool("repo_overview", repo="acme/app")
+
+    assert "fastapi/params.py" not in result["summary"], "the cap still hides it"
+    assert f"docs/ ({tools.MAX_TREE_PATHS} files)" in result["summary"]
+    assert "fastapi/ (2 files)" in result["summary"]
+    assert "path set to a folder" in result["summary"]
+
+
+def test_repo_overview_path_lists_one_folder(fake_github):
+    overview_routes(fake_github, files=DOCS_FIRST)
+    result, ctx = call_tool("repo_overview", repo="acme/app", path="/fastapi/")
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Inspected acme/app/fastapi (2 files)"
+    assert "fastapi/params.py" in result["summary"]
+    assert "fastapi/dependencies/ (1 files)" in result["summary"]
+    assert "docs/" not in result["summary"]
+    assert ctx["sources"] == [{"title": "acme/app/fastapi",
+                               "url": "https://github.com/acme/app/tree/main/fastapi"}]
+    assert not any(r.url.path.endswith("/readme") for r in fake_github.requests)
+
+
+def test_repo_overview_unknown_folder_fails(fake_github):
+    overview_routes(fake_github)
+    result, ctx = call_tool("repo_overview", repo="acme/app", path="nope")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "No folder 'nope'" in result["error"]
+
+
+def test_repo_overview_rejects_parent_path_without_a_request(fake_github):
+    result, ctx = call_tool("repo_overview", repo="acme/app", path="../secrets")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert fake_github.requests == []
+
+
 @pytest.mark.live
 @needs_token
 def test_live_repo_overview_follows_renames():
@@ -387,12 +452,555 @@ def test_read_repo_file_rejects_bad_paths_without_a_request(fake_github, path):
     assert fake_github.requests == []
 
 
+# --- duckdb_query ------------------------------------------------------------------
+
+@pytest.fixture
+def tiny_repos(monkeypatch, tmp_path):
+    """Point duckdb_query at a three-repo snapshot written for the test."""
+    path = tmp_path / "repos.parquet"
+    con = duckdb.connect()
+    con.execute(f"""COPY (SELECT * FROM (VALUES
+        ('a/one', 'First', 'Python', 300, 'MIT', ['llm']),
+        ('b/two', 'Second', 'Python', 100, NULL, []),
+        ('c/three', NULL, 'Rust', 200, 'MIT', ['cli', 'llm'])
+    ) t(full_name, description, language, stars, license, topics)) TO '{path}' (FORMAT parquet)""")
+    con.close()
+    monkeypatch.setattr(tools, "REPOS_PARQUET", path)
+    return tmp_path
+
+
+def test_duckdb_query_aggregates(tiny_repos):
+    result, ctx = call_tool("duckdb_query",
+                            sql="SELECT language, count(*) AS n FROM repos GROUP BY language ORDER BY n DESC")
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Query returned 2 rows"
+    assert result["summary"].startswith("2 rows. Columns: language, n")
+    assert "Python | 2" in result["summary"]
+    assert ctx["sources"] == [{"title": f"GitHub repos snapshot {tools.REPOS_SNAPSHOT}", "url": None}]
+    assert ctx["artifacts"][0]["content"] == "language,n\nPython,2\nRust,1\n"
+
+
+def test_duckdb_query_reads_lists_and_nulls(tiny_repos):
+    result, _ = call_tool("duckdb_query",
+                          sql="SELECT full_name, description FROM repos WHERE list_contains(topics, 'cli')")
+    assert "c/three | NULL" in result["summary"]
+
+
+def test_duckdb_query_caps_rows(tiny_repos):
+    result, _ = call_tool("duckdb_query", sql=f"SELECT * FROM range({tools.MAX_QUERY_ROWS + 25})")
+
+    assert result["message"] == f"Query returned {tools.MAX_QUERY_ROWS + 25} rows"
+    assert result["summary"].startswith(f"First {tools.MAX_QUERY_ROWS} of {tools.MAX_QUERY_ROWS + 25} rows")
+    assert result["artifacts"][0]["content"].count("\n") == tools.MAX_QUERY_ROWS + 1  # header + rows
+
+
+def test_duckdb_query_caps_cell_text(tiny_repos):
+    result, _ = call_tool("duckdb_query", sql="SELECT repeat('x', 5000) AS long")
+    assert "x" * tools.MAX_CELL_CHARS + "..." in result["summary"]
+    assert "x" * (tools.MAX_CELL_CHARS + 1) not in result["summary"]
+
+
+@pytest.mark.parametrize("sql", ["", "   "])
+def test_duckdb_query_empty_sql_opens_nothing(monkeypatch, sql):
+    monkeypatch.setattr(tools.duckdb, "connect", lambda *a, **kw: pytest.fail("connected"))
+    result, ctx = call_tool("duckdb_query", sql=sql)
+
+    assert_event_pair(ctx, "tool.failed")
+    assert result["error"] == "Empty SQL query"
+
+
+def test_duckdb_query_bad_sql_shows_duckdb_message(tiny_repos):
+    result, ctx = call_tool("duckdb_query", sql="SELECT nope FROM repos")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert result["error"].startswith("DuckDB: Binder Error")
+    assert "nope" in result["error"]
+
+
+def test_duckdb_query_one_statement_only(tiny_repos):
+    result, _ = call_tool("duckdb_query", sql="SELECT 1; SELECT 2")
+    assert result["error"] == "Send exactly one SQL statement"
+
+
+@pytest.mark.parametrize("sql", [
+    "DROP TABLE repos",
+    "INSERT INTO repos (full_name) VALUES ('x/y')",
+    "CREATE TABLE t AS SELECT 1",
+    "COPY repos TO 'out.csv'",
+    "ATTACH 'other.db'",
+    "INSTALL httpfs",
+    "LOAD httpfs",
+    "SET enable_external_access = true",
+    "PRAGMA enable_profiling",
+])
+def test_duckdb_query_refuses_anything_but_reads(tiny_repos, sql):
+    result, ctx = call_tool("duckdb_query", sql=sql)
+
+    assert_event_pair(ctx, "tool.failed")
+    assert result["error"].startswith("Only read queries are allowed")
+    assert sorted(p.name for p in tiny_repos.iterdir()) == ["repos.parquet"]
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM read_csv('{f}')",
+    "SELECT * FROM '{f}'",
+    "SELECT * FROM read_text('{f}')",
+    "SELECT * FROM glob('{d}/*')",
+])
+def test_duckdb_query_cannot_read_files(tiny_repos, sql):
+    secret = tiny_repos / "secret.csv"
+    secret.write_text("token\nghp_SECRET\n")
+    result, ctx = call_tool("duckdb_query", sql=sql.format(f=secret, d=tiny_repos))
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "Permission Error" in result["error"]
+    assert "ghp_SECRET" not in str(result)
+
+
+@pytest.mark.parametrize("sql", [
+    "COPY repos TO '{d}/out.csv'",
+    "ATTACH '{d}/other.db'",
+    "INSTALL httpfs",
+    "LOAD httpfs",
+    "SET enable_external_access = true",
+    "SET lock_configuration = false",
+])
+def test_duckdb_locked_even_past_the_statement_check(tiny_repos, sql):
+    """Second line of defence: had a write slipped past the type check, DuckDB still refuses it."""
+    con = duckdb.connect()
+    tools.open_repos_db(con)
+    with pytest.raises(duckdb.Error):
+        con.execute(sql.format(d=tiny_repos))
+    assert sorted(p.name for p in tiny_repos.iterdir()) == ["repos.parquet"]
+
+
+def test_duckdb_query_timeout_interrupts(tiny_repos, monkeypatch):
+    real_connect = duckdb.connect
+    spies = []
+
+    class Spy:
+        def __init__(self):
+            self.con = real_connect()
+            self.interrupted = False
+            spies.append(self)
+
+        def interrupt(self):
+            self.interrupted = True
+            self.con.interrupt()
+
+        def __getattr__(self, name):
+            return getattr(self.con, name)
+
+    monkeypatch.setattr(tools.duckdb, "connect", lambda *a, **kw: Spy())
+    monkeypatch.setattr(tools, "QUERY_TIMEOUT_S", 0.5)
+    result, ctx = call_tool("duckdb_query",
+                            sql="SELECT count(*) FROM range(100000000000) WHERE range % 7 = 3")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "took longer than 0.5 s" in result["error"]
+    assert spies[0].interrupted  # and the test only finishes because the worker thread stopped
+
+
+def test_duckdb_real_snapshot_loads():
+    assert tools.REPOS_PARQUET.exists(), "run data/build_repos.py"
+    result, ctx = call_tool("duckdb_query", sql="DESCRIBE repos")
+
+    assert_event_pair(ctx, "tool.completed")
+    columns = [line.split(" | ")[0] for line in result["summary"].splitlines()[3:]]
+    assert columns == ["full_name", "description", "language", "stars", "forks", "open_issues",
+                       "license", "topics", "created_at", "pushed_at", "archived", "html_url"]
+    description = DECLARED["duckdb_query"].description
+    assert all(c in description for c in columns), "Gemini must be told every column"
+
+
 @pytest.mark.live
 @needs_token
 def test_live_read_repo_file():
     result, ctx = call_tool("read_repo_file", repo="fastapi/fastapi", path="README.md")
     assert_event_pair(ctx, "tool.completed")
     assert "FastAPI" in result["summary"]
+
+
+# --- run_cpp -----------------------------------------------------------------------
+#
+# Docker is faked: `fake_docker` replaces asyncio.create_subprocess_exec, so the
+# real tool code builds the command and parses the sandbox's output. The sample
+# programs in samples/cpp/ are the inputs. With Docker installed and the image
+# pulled (docker pull gcc:14), `python -m pytest -m live -k run_cpp` runs one for real.
+
+SAMPLES = os.path.join(os.path.dirname(__file__), "samples", "cpp")
+
+
+def sample(name):
+    with open(os.path.join(SAMPLES, name), encoding="utf-8") as f:
+        return f.read()
+
+
+class FakeProcess:
+    def __init__(self, stdout=b"", stderr=b"", returncode=0, hang=False):
+        self.stdout, self.stderr, self.returncode, self.hang = stdout, stderr, returncode, hang
+        self.input = None
+        self.killed = False
+
+    async def communicate(self, input=None):
+        self.input = input
+        if self.hang:
+            await asyncio.sleep(3600)
+        return self.stdout, self.stderr
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.fixture
+def fake_docker(monkeypatch):
+    """Answer each subprocess call with the next FakeProcess in `.processes`.
+
+    `.answer(...)` queues what the container prints: program output on stdout,
+    compiler output on stderr, then the status line. Each call's argv is
+    recorded in `.calls`; extra calls (docker kill) get an empty process.
+    """
+    class Fake:
+        def answer(self, compile=0, run=0, compiler=b"", program=b""):
+            status = b"\n@@cpp compile=%d run=%d\n" % (compile, run)
+            self.processes.append(FakeProcess(program, compiler + status))
+
+    fake = Fake()
+    fake.calls, fake.processes = [], []
+
+    async def fake_exec(*argv, **kwargs):
+        fake.calls.append(list(argv))
+        return fake.processes.pop(0) if fake.processes else FakeProcess()
+
+    monkeypatch.setattr(tools.asyncio, "create_subprocess_exec", fake_exec)
+    return fake
+
+
+def test_run_cpp_success(fake_docker):
+    fake_docker.answer(program=b"Hello from C++\nsum 1..10 = 55\n")
+    result, ctx = call_tool("run_cpp", code=sample("hello.cpp"))
+
+    assert_event_pair(ctx, "tool.completed")
+    assert ctx["events"][0]["message"] == "Compiling C++"
+    assert result["message"] == "Execution completed (exit 0)"
+    assert "Compiled: yes. Exit status: 0. Timed out: no." in result["summary"]
+    assert "sum 1..10 = 55" in result["summary"]
+    assert ctx["sources"] == []
+    assert ctx["artifacts"] == [{"name": "C++ program output", "content": "Hello from C++\nsum 1..10 = 55\n"}]
+
+
+def test_run_cpp_sandbox_flags_and_code_on_stdin(fake_docker, monkeypatch):
+    monkeypatch.delenv("CPP_SANDBOX_IMAGE", raising=False)
+    fake_docker.answer()
+    proc = fake_docker.processes[0]
+    code = sample("hello.cpp")
+    call_tool("run_cpp", code=code)
+
+    argv = fake_docker.calls[0]
+    joined = " ".join(argv)
+    assert argv[:3] == ["docker", "run", "--rm"]
+    for flag in ["--network none", "--memory 256m", "--cpus 1", "--pids-limit 64", "--read-only",
+                 "--cap-drop ALL", "--security-opt no-new-privileges", "gcc:14 sh -c"]:
+        assert flag in joined
+    assert not any("Hello from C++" in a for a in argv), "code must go on stdin, not argv"
+    assert proc.input == code.encode()
+
+
+def test_run_cpp_image_can_be_overridden(fake_docker, monkeypatch):
+    monkeypatch.setenv("CPP_SANDBOX_IMAGE", "gcc:13")
+    fake_docker.answer()
+    call_tool("run_cpp", code=sample("hello.cpp"))
+    assert "gcc:13" in fake_docker.calls[0]
+
+
+def test_run_cpp_compile_error_is_a_result(fake_docker):
+    fake_docker.answer(compile=1, run=-1,
+                       compiler=b"main.cpp:5:18: error: 'count' was not declared in this scope")
+    result, ctx = call_tool("run_cpp", code=sample("compile_error.cpp"))
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Compilation failed"
+    assert "Compiled: no. Exit status: not run." in result["summary"]
+    assert "'count' was not declared" in result["summary"]
+    assert [a["name"] for a in ctx["artifacts"]] == ["C++ compiler output"]
+
+
+def test_run_cpp_runtime_crash_is_a_result(fake_docker):
+    fake_docker.answer(run=134, program=b"about to read v[5]\nterminate called after throwing an instance "
+                                        b"of 'std::out_of_range'\n")
+    result, ctx = call_tool("run_cpp", code=sample("runtime_error.cpp"))
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Execution completed (exit 134)"
+    assert "Exit status: 134 (killed by signal 6)" in result["summary"]
+    assert "out_of_range" in result["summary"]
+
+
+def test_run_cpp_nonzero_exit(fake_docker):
+    fake_docker.answer(run=3)
+    result, _ = call_tool("run_cpp", code="int main() { return 3; }")
+    assert "Exit status: 3." in result["summary"]
+    assert "Program output:\n(none)" in result["summary"]
+
+
+def test_run_cpp_program_timeout_is_a_result(fake_docker):
+    fake_docker.answer(run=124)
+    result, ctx = call_tool("run_cpp", code=sample("infinite_loop.cpp"))
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == f"Program timed out after {tools.CPP_RUN_TIMEOUT_S} s"
+    assert "Timed out: yes" in result["summary"]
+
+
+def test_run_cpp_hung_sandbox_is_killed_by_name(fake_docker, monkeypatch):
+    monkeypatch.setattr(tools, "CPP_SANDBOX_TIMEOUT_S", 0.05)
+    hung = FakeProcess(hang=True)
+    fake_docker.processes.append(hung)
+    result, ctx = call_tool("run_cpp", code=sample("infinite_loop.cpp"))
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "did not finish" in result["error"]
+    run_argv, kill_argv = fake_docker.calls
+    name = run_argv[run_argv.index("--name") + 1]
+    assert kill_argv == ["docker", "kill", name], "killing the CLI alone leaves the container running"
+    assert hung.killed
+
+
+def test_run_cpp_truncates_long_output(fake_docker):
+    fake_docker.answer(program=b"x" * (tools.MAX_CPP_OUTPUT_CHARS + 1))
+    result, ctx = call_tool("run_cpp", code="int main() {}")
+
+    assert f"Program output (truncated to {tools.MAX_CPP_OUTPUT_CHARS} chars)" in result["summary"]
+    assert len(ctx["artifacts"][0]["content"]) == tools.MAX_CPP_OUTPUT_CHARS
+
+
+def test_run_cpp_empty_code_starts_nothing(fake_docker):
+    result, ctx = call_tool("run_cpp", code="   ")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "No C++ code" in result["error"]
+    assert fake_docker.calls == []
+
+
+def test_run_cpp_without_docker(monkeypatch):
+    async def missing(*argv, **kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(tools.asyncio, "create_subprocess_exec", missing)
+    result, ctx = call_tool("run_cpp", code=sample("hello.cpp"))
+
+    assert_event_pair(ctx, "tool.failed")
+    assert "Docker is not available" in result["error"]
+
+
+@pytest.mark.parametrize("stderr, expected", [
+    (b"Unable to find image 'gcc:14' locally\n", "not pulled"),
+    (b"docker: Error response from daemon: secret detail\n", "could not run the program (docker exit 125)"),
+])
+def test_run_cpp_docker_failure(fake_docker, capsys, stderr, expected):
+    fake_docker.processes.append(FakeProcess(stderr=stderr, returncode=125))
+    result, ctx = call_tool("run_cpp", code=sample("hello.cpp"))
+
+    assert_event_pair(ctx, "tool.failed")
+    assert expected in result["error"]
+    assert "secret detail" not in result["error"]
+    assert stderr.decode().strip() in capsys.readouterr().out, "docker's text must still reach the log"
+
+
+@pytest.mark.live
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker not installed")
+def test_live_run_cpp():
+    """Needs Docker and the image pulled first:  docker pull gcc:14"""
+    result, ctx = call_tool("run_cpp", code=sample("hello.cpp"))
+    assert_event_pair(ctx, "tool.completed")
+    assert "sum 1..10 = 55" in result["summary"]
+
+
+# --- python_execution --------------------------------------------------------------
+# Offline: the tool's real code runs, only the docker subprocess is faked.
+# Live: real Docker, checking that the sandbox limits actually hold.
+
+class FakePythonProcess:
+    def __init__(self, stdout=b"", stderr=b"", exit_code=0, hang=False):
+        self.stdout, self.stderr, self.exit_code, self.hang = stdout, stderr, exit_code, hang
+        self.returncode = None
+        self.stdin = None
+        self.killed = False
+
+    async def communicate(self, data):
+        self.stdin = data
+        if self.hang:
+            await asyncio.sleep(3600)
+        self.returncode = self.exit_code
+        return self.stdout, self.stderr
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.fixture
+def fake_python_docker(monkeypatch):
+    """Answer `docker run` with fake.process and record every command in .calls."""
+    fake = SimpleNamespace(calls=[], process=FakePythonProcess(), installed=True)
+
+    async def create_subprocess_exec(*argv, **kwargs):
+        fake.calls.append(list(argv))
+        if not fake.installed:
+            raise FileNotFoundError("docker")
+        if argv[:2] == ("docker", "rm"):
+            return FakePythonProcess()
+        return fake.process
+
+    monkeypatch.setattr(tools.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    return fake
+
+
+def test_python_execution_returns_output(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(stdout=b"45\n")
+    result, ctx = call_tool("python_execution", code="print(sum(range(10)))")
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Execution completed (exit 0)"
+    assert "45" in result["summary"]
+    assert fake_python_docker.process.stdin == b"print(sum(range(10)))"
+    names = [a["name"] for a in ctx["artifacts"]]
+    assert names == ["Python program", "Python output"]
+
+
+def test_python_execution_runs_in_a_locked_down_container(fake_python_docker):
+    call_tool("python_execution", code="print(1)")
+    argv = fake_python_docker.calls[0]
+    pairs = set(zip(argv, argv[1:]))
+
+    assert argv[:2] == ["docker", "run"]
+    for flag in [("--network", "none"), ("--memory", "256m"), ("--pull", "never"),
+                 ("--user", "65534:65534"), ("--cap-drop", "ALL")]:
+        assert flag in pairs, f"missing {flag}"
+    assert "--read-only" in argv and "--rm" in argv
+    for leak in ("-e", "--env", "--env-file", "-v", "--volume", "--mount", "--privileged"):
+        assert leak not in argv, f"{leak} would expose our files or keys"
+    assert argv[-3:] == ["python", "-I", "-"]
+
+
+def test_python_error_is_a_completed_run_with_the_traceback(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(stderr=b"ZeroDivisionError: division by zero\n", exit_code=1)
+    result, ctx = call_tool("python_execution", code="1/0")
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Execution completed (exit 1)"
+    assert "ZeroDivisionError" in result["summary"]
+
+
+def test_python_memory_kill_is_explained(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(exit_code=137)
+    result, _ = call_tool("python_execution", code="x = 'a' * 10**10")
+    assert "256 MB" in result["message"]
+
+
+def test_python_timeout_fails(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(exit_code=124)
+    result, ctx = call_tool("python_execution", code="while True: pass")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert result == {"error": f"Execution timed out after {tools.PYTHON_TIMEOUT_S} s"}
+
+
+@pytest.mark.parametrize("stderr, expected", [
+    ("Unable to find image locally. No such image: python:3.12-slim", "docker pull"),
+    ("failed to connect to the docker API at unix:///x.sock", "not running"),
+    ("Cannot connect to the Docker daemon at unix:///var/run/docker.sock", "not running"),
+    ("something unexpected", "could not start"),
+])
+def test_python_docker_problems_are_explained(fake_python_docker, stderr, expected):
+    fake_python_docker.process = FakePythonProcess(stderr=stderr.encode(), exit_code=125)
+    result, ctx = call_tool("python_execution", code="print(1)")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert expected in result["error"]
+
+
+def test_python_without_docker_installed(fake_python_docker):
+    fake_python_docker.installed = False
+    result, _ = call_tool("python_execution", code="print(1)")
+    assert result == {"error": "Docker is not installed, so Python cannot run"}
+
+
+def test_python_stuck_container_is_removed(fake_python_docker, monkeypatch):
+    monkeypatch.setattr(tools, "PYTHON_TIMEOUT_S", 0)
+    monkeypatch.setattr(tools, "DOCKER_START_S", 0.05)
+    fake_python_docker.process = FakePythonProcess(hang=True)
+    result, _ = call_tool("python_execution", code="print(1)")
+
+    assert result == {"error": "Docker did not finish in time"}
+    assert fake_python_docker.process.killed
+    name = fake_python_docker.calls[0][fake_python_docker.calls[0].index("--name") + 1]
+    assert ["docker", "rm", "-f", name] in fake_python_docker.calls
+
+
+@pytest.mark.parametrize("code", ["", "   ", "x" * (tools.MAX_CODE_CHARS + 1)])
+def test_python_bad_code_starts_no_container(fake_python_docker, code):
+    result, _ = call_tool("python_execution", code=code)
+    assert "error" in result
+    assert fake_python_docker.calls == []
+
+
+def test_python_long_output_is_cut(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(stdout=b"x" * (tools.MAX_OUTPUT_CHARS + 500))
+    result, _ = call_tool("python_execution", code="print('x' * 5000)")
+    assert f"cut off at {tools.MAX_OUTPUT_CHARS} characters" in result["summary"]
+
+
+needs_docker = pytest.mark.skipif(shutil.which("docker") is None, reason="docker not installed")
+
+
+@pytest.mark.live
+@needs_docker
+def test_live_python_runs_real_code():
+    result, ctx = call_tool("python_execution", code="print(sum(range(10)))")
+    assert_event_pair(ctx, "tool.completed")
+    assert "45" in result["summary"]
+
+
+@pytest.mark.live
+@needs_docker
+def test_live_python_sandbox_holds():
+    code = "\n".join([
+        "import os, socket",
+        "try:",
+        "    socket.create_connection(('1.1.1.1', 53), timeout=2); print('NETWORK OPEN')",
+        "except OSError:",
+        "    print('network blocked')",
+        "try:",
+        "    open('/escape.txt', 'w'); print('FILESYSTEM WRITABLE')",
+        "except OSError:",
+        "    print('filesystem read-only')",
+        "print('uid', os.getuid())",
+        "print('env', sorted(os.environ))",
+    ])
+    result, _ = call_tool("python_execution", code=code)
+
+    assert "network blocked" in result["summary"]
+    assert "filesystem read-only" in result["summary"]
+    assert "uid 65534" in result["summary"]
+    # The image sets its own GPG_KEY; none of ours may get in.
+    for secret in ("GEMINI_API_KEY", "GITHUB_TOKEN"):
+        assert secret not in result["summary"]
+
+
+@pytest.mark.live
+@needs_docker
+def test_live_python_infinite_loop_times_out():
+    result, ctx = call_tool("python_execution", code="while True: pass")
+    assert_event_pair(ctx, "tool.failed")
+    assert "timed out" in result["error"]
 
 
 # --- Registry wiring (checks every tool automatically) -------------------------------
