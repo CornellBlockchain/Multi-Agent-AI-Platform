@@ -107,6 +107,68 @@ async def github_search(query: str) -> dict:
         "artifacts": [],
     }
 
+MAX_TREE_PATHS = 300
+
+async def repo_overview(repo: str) -> dict:
+    repo = check_repo(repo)
+
+    # metadata
+    info = (await github_get(f"/repos/{repo}")).json()
+    branch = info['default_branch']
+
+    # readme
+    try:
+        readme = (await github_get(f'/repos/{repo}/readme', raw = True)).text
+    except ToolError:
+        readme = "(no README)"
+
+    # default branch paths
+
+    tree = (await github_get(f'/repos/{repo}/git/trees/{branch}?recursive=1')).json()
+    files = [t["path"] for t in tree.get("tree", []) if t["type"] == "blob"]
+    shown = files[:MAX_TREE_PATHS]
+    more = f"\n... {len(files) - len(shown)} more files" if len(files) > len(shown) else ""
+
+    url = info['html_url']
+    return{
+    "message": f"Inspected {repo} ({len(files)} files)",
+        "summary": (
+            f"{repo}: {info.get('description') or 'no description'}\n"
+            f"{info['stargazers_count']} stars, language {info.get('language') or 'n/a'}, "
+            f"default branch {branch}.\n\n"
+            f"README (start):\n{readme[:3000]}\n\n"
+            f"Files:\n" + "\n".join(shown) + more
+        ),
+        "sources": [
+            {"title": repo, "url": url},
+            {"title": f"{repo} README", "url": f"{url}#readme"},
+        ],
+        "artifacts": [{"name": f"{repo} file tree", "content": "\n".join(shown) + more}]
+    }
+
+MAX_FILE_CHARS = 12_000
+
+async def read_repo_file(repo: str, path: str) -> dict:
+    repo = check_repo(repo)
+    path = path.strip().lstrip("/")
+    if not path or ".." in path.split("/"):
+        raise ToolError(f"Invalid file path '{path}'")
+
+    r = await github_get(f"/repos/{repo}/contents/{path}", raw=True)
+    if r.headers.get("content-type", "").startswith("application/json"):
+        raise ToolError(f"'{path}' is a directory, not a file")
+
+    text = r.text
+    truncated = len(text) > MAX_FILE_CHARS
+    text = text[:MAX_FILE_CHARS]
+
+    return {
+        "message": f"Read {path}" + (" (truncated)" if truncated else ""),
+        "summary": text,
+        "sources": [{"title": f"{repo}/{path}", "url": f"https://github.com/{repo}/blob/HEAD/{path}"}],
+        "artifacts": [{"name": f"{repo}/{path}", "content": text}],
+    }
+
 async def check_public_url(url: str) -> None:
     """Refuse anything but http(s) to a public address.
 
@@ -193,9 +255,112 @@ async def playwright_browse(url: str) -> dict:
         "artifacts": [{"name": f"Page text: {title}", "content": text[:MAX_PAGE_CHARS]}],
     }
 
+PYTHON_IMAGE = "python:3.12-slim"
+PYTHON_TIMEOUT_S = 10
+DOCKER_START_S = 20  # allowed on top of PYTHON_TIMEOUT_S for the container to start
+MAX_CODE_CHARS = 20_000
+MAX_OUTPUT_CHARS = 4_000
+
+def sandbox_command(name: str) -> list[str]:
+    """docker run flags that keep the program away from the network, our files and our keys.
+    Nothing from our environment is passed in, so GEMINI_API_KEY and GITHUB_TOKEN never reach it."""
+    return [
+        "docker", "run", "--rm", "-i", "--name", name, "--pull", "never",
+        "--network", "none",
+        "--read-only", "--tmpfs", "/tmp:size=16m",
+        "--memory", "256m", "--memory-swap", "256m", "--cpus", "1", "--pids-limit", "64",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--user", "65534:65534",
+        PYTHON_IMAGE,
+        "timeout", "-k", "2", str(PYTHON_TIMEOUT_S), "python", "-I", "-",
+    ]
+
+async def stop_container(proc, name: str) -> None:
+    """Killing the docker client does not stop the container, so remove it by name."""
+    if proc.returncode is None:
+        proc.kill()
+    rm = await asyncio.create_subprocess_exec(
+        "docker", "rm", "-f", name,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    await rm.wait()
+    await proc.wait()
+
+def clip(text: str) -> str:
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return text
+    return text[:MAX_OUTPUT_CHARS] + f"\n... cut off at {MAX_OUTPUT_CHARS} characters"
+
+async def python_execution(code: str) -> dict:
+    """
+    Run a Python program in a throwaway Docker container and return what it printed
+    Can adjust PYTHON_TIMEOUT_S and the limits in sandbox_command
+    """
+    if not code.strip():
+        raise ToolError("No Python code was given")
+    if len(code) > MAX_CODE_CHARS:
+        raise ToolError(f"Programs are limited to {MAX_CODE_CHARS} characters")
+
+    name = f"dev-agent-python-{uuid.uuid4().hex[:12]}"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *sandbox_command(name),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise ToolError("Docker is not installed, so Python cannot run")
+
+    start = time.perf_counter()
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(code.encode()), timeout=PYTHON_TIMEOUT_S + DOCKER_START_S
+        )
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        # Timed out, or the whole agent run was cancelled: never leave the container running.
+        await stop_container(proc, name)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise ToolError("Docker did not finish in time")
+    ms = round((time.perf_counter() - start) * 1000)
+
+    stdout = out.decode(errors="replace")
+    stderr = err.decode(errors="replace")
+    exit_code = proc.returncode
+
+    if exit_code == 124:  # set by `timeout` inside the container
+        raise ToolError(f"Execution timed out after {PYTHON_TIMEOUT_S} s")
+    if exit_code == 125:  # docker itself failed before the program started
+        if "No such image" in stderr:
+            raise ToolError(f"The {PYTHON_IMAGE} image is missing. Run: docker pull {PYTHON_IMAGE}")
+        if "daemon" in stderr or "docker API" in stderr:
+            raise ToolError("Docker is not running, so Python cannot run")
+        print(f"[error] python_execution {name}: docker exit 125: {stderr.strip()}", flush=True)
+        raise ToolError("Docker could not start the container")
+
+    if exit_code == 0:
+        message = "Execution completed (exit 0)"
+    elif exit_code == 137:
+        message = "Execution stopped (exit 137, usually over the 256 MB memory limit)"
+    else:
+        message = f"Execution completed (exit {exit_code})"
+
+    output = f"stdout:\n{clip(stdout) or '(empty)'}\n\nstderr:\n{clip(stderr) or '(empty)'}"
+    return {
+        "message": message,
+        "summary": f"Ran the program in an isolated container ({ms} ms). Exit code {exit_code}.\n\n{output}",
+        "sources": [],
+        "artifacts": [
+            {"name": "Python program", "content": code},
+            {"name": "Python output", "content": f"Exit code {exit_code}\n\n{output}"},
+        ],
+    }
+
 TOOLS = {
     "github_search": {"fn": github_search, "start": "Searching GitHub"},
+    "repo_overview": {"fn": repo_overview, "start": "Inspecting repository"},
+    "read_repo_file": {"fn": read_repo_file, "start": "Reading repository file"},
     "playwright_browse": {"fn": playwright_browse, "start": "Opening page"},
+    "python_execution": {"fn": python_execution, "start": "Running Python"},
 }
 
 TOOL_DECLARATIONS = [
@@ -215,6 +380,24 @@ TOOL_DECLARATIONS = [
         },
     ),
     types.FunctionDeclaration(
+        name="repo_overview",
+        description="Inspect one GitHub repository: description, stars, language, README "
+                    "and file tree. Use after github_search to look inside a result, "
+                    "and to find file paths for read_repo_file.",
+        parameters={"type": "OBJECT", "properties": {
+            "repo": {"type": "STRING", "description": "owner/name, e.g. 'duckdb/duckdb'"},
+        }, "required": ["repo"]},
+    ),
+    types.FunctionDeclaration(
+        name="read_repo_file",
+        description="Read the source of one file in a GitHub repository. Use a path "
+                    "taken from repo_overview's file tree, not a guessed one.",
+        parameters={"type": "OBJECT", "properties": {
+            "repo": {"type": "STRING", "description": "owner/name"},
+            "path": {"type": "STRING", "description": "file path, e.g. 'fastapi/routing.py'"},
+        }, "required": ["repo", "path"]},
+    ),
+    types.FunctionDeclaration(
         name="playwright_browse",
         description="Open one public web page in a real browser, including pages built with "
                     "JavaScript. Returns its title, final URL and visible text.",
@@ -228,6 +411,15 @@ TOOL_DECLARATIONS = [
             },
             "required": ["url"],
         },
+    ),
+    types.FunctionDeclaration(
+        name="python_execution",
+        description="Run a short, self-contained Python 3.12 program and return its stdout, "
+                    "stderr and exit code. It runs in an isolated container with no network, "
+                    "no files, only the standard library and a 10 second limit.",
+        parameters={"type": "OBJECT", "properties": {
+            "code": {"type": "STRING", "description": "Complete Python program that prints its results"},
+        }, "required": ["code"]},
     ),
 ]
 
