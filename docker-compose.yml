@@ -1,0 +1,42 @@
+# Each team's service has its own profile so it can be turned on or off.
+#   Everything:          docker compose --profile all up --build
+#   Pick services:       docker compose --profile backend --profile research up --build
+#   Stop one service:    docker compose stop developer
+# Services without their profile enabled are simply not started.
+
+services:
+  backend:
+    build: ./backend
+    profiles: ["backend", "all"]
+    ports: ["8000:8000"]
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      RESEARCH_AGENT_URL: http://research:8000
+      DEVELOPER_AGENT_URL: http://developer:8000
+
+  research:
+    build: ./agents/research
+    profiles: ["research", "agents", "all"]
+    ports: ["8001:8000"]
+    env_file:
+      - path: ./agents/research/.env
+        required: false
+    environment:
+      BACKEND_URL: http://backend:8000
+
+  developer:
+    build: ./agents/developer
+    profiles: ["developer", "agents", "all"]
+    ports: ["8002:8000"]
+    env_file:
+      - path: ./agents/developer/.env
+        required: false
+    environment:
+      BACKEND_URL: http://backend:8000
+
+  frontend:
+    build: ./frontend
+    profiles: ["frontend", "all"]
+    ports: ["3000:80"]
