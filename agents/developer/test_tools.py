@@ -20,6 +20,7 @@ import asyncio
 import inspect
 import os
 import shutil
+from types import SimpleNamespace
 
 import duckdb
 import httpx
@@ -817,6 +818,189 @@ def test_live_run_cpp():
     result, ctx = call_tool("run_cpp", code=sample("hello.cpp"))
     assert_event_pair(ctx, "tool.completed")
     assert "sum 1..10 = 55" in result["summary"]
+
+
+# --- python_execution --------------------------------------------------------------
+# Offline: the tool's real code runs, only the docker subprocess is faked.
+# Live: real Docker, checking that the sandbox limits actually hold.
+
+class FakePythonProcess:
+    def __init__(self, stdout=b"", stderr=b"", exit_code=0, hang=False):
+        self.stdout, self.stderr, self.exit_code, self.hang = stdout, stderr, exit_code, hang
+        self.returncode = None
+        self.stdin = None
+        self.killed = False
+
+    async def communicate(self, data):
+        self.stdin = data
+        if self.hang:
+            await asyncio.sleep(3600)
+        self.returncode = self.exit_code
+        return self.stdout, self.stderr
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.fixture
+def fake_python_docker(monkeypatch):
+    """Answer `docker run` with fake.process and record every command in .calls."""
+    fake = SimpleNamespace(calls=[], process=FakePythonProcess(), installed=True)
+
+    async def create_subprocess_exec(*argv, **kwargs):
+        fake.calls.append(list(argv))
+        if not fake.installed:
+            raise FileNotFoundError("docker")
+        if argv[:2] == ("docker", "rm"):
+            return FakePythonProcess()
+        return fake.process
+
+    monkeypatch.setattr(tools.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    return fake
+
+
+def test_python_execution_returns_output(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(stdout=b"45\n")
+    result, ctx = call_tool("python_execution", code="print(sum(range(10)))")
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Execution completed (exit 0)"
+    assert "45" in result["summary"]
+    assert fake_python_docker.process.stdin == b"print(sum(range(10)))"
+    names = [a["name"] for a in ctx["artifacts"]]
+    assert names == ["Python program", "Python output"]
+
+
+def test_python_execution_runs_in_a_locked_down_container(fake_python_docker):
+    call_tool("python_execution", code="print(1)")
+    argv = fake_python_docker.calls[0]
+    pairs = set(zip(argv, argv[1:]))
+
+    assert argv[:2] == ["docker", "run"]
+    for flag in [("--network", "none"), ("--memory", "256m"), ("--pull", "never"),
+                 ("--user", "65534:65534"), ("--cap-drop", "ALL")]:
+        assert flag in pairs, f"missing {flag}"
+    assert "--read-only" in argv and "--rm" in argv
+    for leak in ("-e", "--env", "--env-file", "-v", "--volume", "--mount", "--privileged"):
+        assert leak not in argv, f"{leak} would expose our files or keys"
+    assert argv[-3:] == ["python", "-I", "-"]
+
+
+def test_python_error_is_a_completed_run_with_the_traceback(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(stderr=b"ZeroDivisionError: division by zero\n", exit_code=1)
+    result, ctx = call_tool("python_execution", code="1/0")
+
+    assert_event_pair(ctx, "tool.completed")
+    assert result["message"] == "Execution completed (exit 1)"
+    assert "ZeroDivisionError" in result["summary"]
+
+
+def test_python_memory_kill_is_explained(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(exit_code=137)
+    result, _ = call_tool("python_execution", code="x = 'a' * 10**10")
+    assert "256 MB" in result["message"]
+
+
+def test_python_timeout_fails(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(exit_code=124)
+    result, ctx = call_tool("python_execution", code="while True: pass")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert result == {"error": f"Execution timed out after {tools.PYTHON_TIMEOUT_S} s"}
+
+
+@pytest.mark.parametrize("stderr, expected", [
+    ("Unable to find image locally. No such image: python:3.12-slim", "docker pull"),
+    ("failed to connect to the docker API at unix:///x.sock", "not running"),
+    ("Cannot connect to the Docker daemon at unix:///var/run/docker.sock", "not running"),
+    ("something unexpected", "could not start"),
+])
+def test_python_docker_problems_are_explained(fake_python_docker, stderr, expected):
+    fake_python_docker.process = FakePythonProcess(stderr=stderr.encode(), exit_code=125)
+    result, ctx = call_tool("python_execution", code="print(1)")
+
+    assert_event_pair(ctx, "tool.failed")
+    assert expected in result["error"]
+
+
+def test_python_without_docker_installed(fake_python_docker):
+    fake_python_docker.installed = False
+    result, _ = call_tool("python_execution", code="print(1)")
+    assert result == {"error": "Docker is not installed, so Python cannot run"}
+
+
+def test_python_stuck_container_is_removed(fake_python_docker, monkeypatch):
+    monkeypatch.setattr(tools, "PYTHON_TIMEOUT_S", 0)
+    monkeypatch.setattr(tools, "DOCKER_START_S", 0.05)
+    fake_python_docker.process = FakePythonProcess(hang=True)
+    result, _ = call_tool("python_execution", code="print(1)")
+
+    assert result == {"error": "Docker did not finish in time"}
+    assert fake_python_docker.process.killed
+    name = fake_python_docker.calls[0][fake_python_docker.calls[0].index("--name") + 1]
+    assert ["docker", "rm", "-f", name] in fake_python_docker.calls
+
+
+@pytest.mark.parametrize("code", ["", "   ", "x" * (tools.MAX_CODE_CHARS + 1)])
+def test_python_bad_code_starts_no_container(fake_python_docker, code):
+    result, _ = call_tool("python_execution", code=code)
+    assert "error" in result
+    assert fake_python_docker.calls == []
+
+
+def test_python_long_output_is_cut(fake_python_docker):
+    fake_python_docker.process = FakePythonProcess(stdout=b"x" * (tools.MAX_OUTPUT_CHARS + 500))
+    result, _ = call_tool("python_execution", code="print('x' * 5000)")
+    assert f"cut off at {tools.MAX_OUTPUT_CHARS} characters" in result["summary"]
+
+
+needs_docker = pytest.mark.skipif(shutil.which("docker") is None, reason="docker not installed")
+
+
+@pytest.mark.live
+@needs_docker
+def test_live_python_runs_real_code():
+    result, ctx = call_tool("python_execution", code="print(sum(range(10)))")
+    assert_event_pair(ctx, "tool.completed")
+    assert "45" in result["summary"]
+
+
+@pytest.mark.live
+@needs_docker
+def test_live_python_sandbox_holds():
+    code = "\n".join([
+        "import os, socket",
+        "try:",
+        "    socket.create_connection(('1.1.1.1', 53), timeout=2); print('NETWORK OPEN')",
+        "except OSError:",
+        "    print('network blocked')",
+        "try:",
+        "    open('/escape.txt', 'w'); print('FILESYSTEM WRITABLE')",
+        "except OSError:",
+        "    print('filesystem read-only')",
+        "print('uid', os.getuid())",
+        "print('env', sorted(os.environ))",
+    ])
+    result, _ = call_tool("python_execution", code=code)
+
+    assert "network blocked" in result["summary"]
+    assert "filesystem read-only" in result["summary"]
+    assert "uid 65534" in result["summary"]
+    # The image sets its own GPG_KEY; none of ours may get in.
+    for secret in ("GEMINI_API_KEY", "GITHUB_TOKEN"):
+        assert secret not in result["summary"]
+
+
+@pytest.mark.live
+@needs_docker
+def test_live_python_infinite_loop_times_out():
+    result, ctx = call_tool("python_execution", code="while True: pass")
+    assert_event_pair(ctx, "tool.failed")
+    assert "timed out" in result["error"]
 
 
 # --- Registry wiring (checks every tool automatically) -------------------------------

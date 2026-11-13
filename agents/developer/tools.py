@@ -467,6 +467,106 @@ async def duckdb_query(sql: str) -> dict:
         "artifacts": [{"name": f"Query result ({shown})", "content": out.getvalue()}],
     }
 
+PYTHON_IMAGE = "python:3.12-slim"
+PYTHON_TIMEOUT_S = 10
+DOCKER_START_S = 20  # allowed on top of PYTHON_TIMEOUT_S for the container to start
+MAX_CODE_CHARS = 20_000
+MAX_OUTPUT_CHARS = 4_000
+
+def sandbox_command(name: str) -> list[str]:
+    """docker run flags that keep the program away from the network, our files and our keys.
+    Nothing from our environment is passed in, so GEMINI_API_KEY and GITHUB_TOKEN never reach it."""
+    return [
+        "docker", "run", "--rm", "-i", "--name", name, "--pull", "never",
+        "--network", "none",
+        "--read-only", "--tmpfs", "/tmp:size=16m",
+        "--memory", "256m", "--memory-swap", "256m", "--cpus", "1", "--pids-limit", "64",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--user", "65534:65534",
+        PYTHON_IMAGE,
+        "timeout", "-k", "2", str(PYTHON_TIMEOUT_S), "python", "-I", "-",
+    ]
+
+async def stop_container(proc, name: str) -> None:
+    """Killing the docker client does not stop the container, so remove it by name."""
+    if proc.returncode is None:
+        proc.kill()
+    rm = await asyncio.create_subprocess_exec(
+        "docker", "rm", "-f", name,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    await rm.wait()
+    await proc.wait()
+
+def clip(text: str) -> str:
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return text
+    return text[:MAX_OUTPUT_CHARS] + f"\n... cut off at {MAX_OUTPUT_CHARS} characters"
+
+async def python_execution(code: str) -> dict:
+    """
+    Run a Python program in a throwaway Docker container and return what it printed
+    Can adjust PYTHON_TIMEOUT_S and the limits in sandbox_command
+    """
+    if not code.strip():
+        raise ToolError("No Python code was given")
+    if len(code) > MAX_CODE_CHARS:
+        raise ToolError(f"Programs are limited to {MAX_CODE_CHARS} characters")
+
+    name = f"dev-agent-python-{uuid.uuid4().hex[:12]}"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *sandbox_command(name),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise ToolError("Docker is not installed, so Python cannot run")
+
+    start = time.perf_counter()
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(code.encode()), timeout=PYTHON_TIMEOUT_S + DOCKER_START_S
+        )
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        # Timed out, or the whole agent run was cancelled: never leave the container running.
+        await stop_container(proc, name)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise ToolError("Docker did not finish in time")
+    ms = round((time.perf_counter() - start) * 1000)
+
+    stdout = out.decode(errors="replace")
+    stderr = err.decode(errors="replace")
+    exit_code = proc.returncode
+
+    if exit_code == 124:  # set by `timeout` inside the container
+        raise ToolError(f"Execution timed out after {PYTHON_TIMEOUT_S} s")
+    if exit_code == 125:  # docker itself failed before the program started
+        if "No such image" in stderr:
+            raise ToolError(f"The {PYTHON_IMAGE} image is missing. Run: docker pull {PYTHON_IMAGE}")
+        if "daemon" in stderr or "docker API" in stderr:
+            raise ToolError("Docker is not running, so Python cannot run")
+        print(f"[error] python_execution {name}: docker exit 125: {stderr.strip()}", flush=True)
+        raise ToolError("Docker could not start the container")
+
+    if exit_code == 0:
+        message = "Execution completed (exit 0)"
+    elif exit_code == 137:
+        message = "Execution stopped (exit 137, usually over the 256 MB memory limit)"
+    else:
+        message = f"Execution completed (exit {exit_code})"
+
+    output = f"stdout:\n{clip(stdout) or '(empty)'}\n\nstderr:\n{clip(stderr) or '(empty)'}"
+    return {
+        "message": message,
+        "summary": f"Ran the program in an isolated container ({ms} ms). Exit code {exit_code}.\n\n{output}",
+        "sources": [],
+        "artifacts": [
+            {"name": "Python program", "content": code},
+            {"name": "Python output", "content": f"Exit code {exit_code}\n\n{output}"},
+        ],
+    }
+
 TOOLS = {
     # limit: calls allowed per task. flash-lite ignores the prompt's "search once
     # or twice" and spends every turn searching; a refusal makes it move on.
@@ -476,6 +576,7 @@ TOOLS = {
     "playwright_browse": {"fn": playwright_browse, "start": "Opening page"},
     "run_cpp": {"fn": run_cpp, "start": "Compiling C++"},
     "duckdb_query": {"fn": duckdb_query, "start": "Querying DuckDB"},
+    "python_execution": {"fn": python_execution, "start": "Running Python"},
 }
 
 TOOL_DECLARATIONS = [
@@ -561,6 +662,15 @@ TOOL_DECLARATIONS = [
             "sql": {"type": "STRING", "description": "One DuckDB SQL statement, e.g. "
                     "'SELECT language, count(*) AS n FROM repos GROUP BY language ORDER BY n DESC'"},
         }, "required": ["sql"]},
+    ),
+    types.FunctionDeclaration(
+        name="python_execution",
+        description="Run a short, self-contained Python 3.12 program and return its stdout, "
+                    "stderr and exit code. It runs in an isolated container with no network, "
+                    "no files, only the standard library and a 10 second limit.",
+        parameters={"type": "OBJECT", "properties": {
+            "code": {"type": "STRING", "description": "Complete Python program that prints its results"},
+        }, "required": ["code"]},
     ),
 ]
 
