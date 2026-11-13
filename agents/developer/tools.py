@@ -107,6 +107,68 @@ async def github_search(query: str) -> dict:
         "artifacts": [],
     }
 
+MAX_TREE_PATHS = 300
+
+async def repo_overview(repo: str) -> dict:
+    repo = check_repo(repo)
+
+    # metadata
+    info = (await github_get(f"/repos/{repo}")).json()
+    branch = info['default_branch']
+
+    # readme
+    try:
+        readme = (await github_get(f'/repos/{repo}/readme', raw = True)).text
+    except ToolError:
+        readme = "(no README)"
+
+    # default branch paths
+
+    tree = (await github_get(f'/repos/{repo}/git/trees/{branch}?recursive=1')).json()
+    files = [t["path"] for t in tree.get("tree", []) if t["type"] == "blob"]
+    shown = files[:MAX_TREE_PATHS]
+    more = f"\n... {len(files) - len(shown)} more files" if len(files) > len(shown) else ""
+
+    url = info['html_url']
+    return{
+    "message": f"Inspected {repo} ({len(files)} files)",
+        "summary": (
+            f"{repo}: {info.get('description') or 'no description'}\n"
+            f"{info['stargazers_count']} stars, language {info.get('language') or 'n/a'}, "
+            f"default branch {branch}.\n\n"
+            f"README (start):\n{readme[:3000]}\n\n"
+            f"Files:\n" + "\n".join(shown) + more
+        ),
+        "sources": [
+            {"title": repo, "url": url},
+            {"title": f"{repo} README", "url": f"{url}#readme"},
+        ],
+        "artifacts": [{"name": f"{repo} file tree", "content": "\n".join(shown) + more}]
+    }
+
+MAX_FILE_CHARS = 12_000
+
+async def read_repo_file(repo: str, path: str) -> dict:
+    repo = check_repo(repo)
+    path = path.strip().lstrip("/")
+    if not path or ".." in path.split("/"):
+        raise ToolError(f"Invalid file path '{path}'")
+
+    r = await github_get(f"/repos/{repo}/contents/{path}", raw=True)
+    if r.headers.get("content-type", "").startswith("application/json"):
+        raise ToolError(f"'{path}' is a directory, not a file")
+
+    text = r.text
+    truncated = len(text) > MAX_FILE_CHARS
+    text = text[:MAX_FILE_CHARS]
+
+    return {
+        "message": f"Read {path}" + (" (truncated)" if truncated else ""),
+        "summary": text,
+        "sources": [{"title": f"{repo}/{path}", "url": f"https://github.com/{repo}/blob/HEAD/{path}"}],
+        "artifacts": [{"name": f"{repo}/{path}", "content": text}],
+    }
+
 async def check_public_url(url: str) -> None:
     """Refuse anything but http(s) to a public address.
 
@@ -195,6 +257,8 @@ async def playwright_browse(url: str) -> dict:
 
 TOOLS = {
     "github_search": {"fn": github_search, "start": "Searching GitHub"},
+    "repo_overview": {"fn": repo_overview, "start": "Inspecting repository"},
+    "read_repo_file": {"fn": read_repo_file, "start": "Reading repository file"},
     "playwright_browse": {"fn": playwright_browse, "start": "Opening page"},
 }
 
@@ -213,6 +277,24 @@ TOOL_DECLARATIONS = [
             },
             "required": ["query"],
         },
+    ),
+    types.FunctionDeclaration(
+        name="repo_overview",
+        description="Inspect one GitHub repository: description, stars, language, README "
+                    "and file tree. Use after github_search to look inside a result, "
+                    "and to find file paths for read_repo_file.",
+        parameters={"type": "OBJECT", "properties": {
+            "repo": {"type": "STRING", "description": "owner/name, e.g. 'duckdb/duckdb'"},
+        }, "required": ["repo"]},
+    ),
+    types.FunctionDeclaration(
+        name="read_repo_file",
+        description="Read the source of one file in a GitHub repository. Use a path "
+                    "taken from repo_overview's file tree, not a guessed one.",
+        parameters={"type": "OBJECT", "properties": {
+            "repo": {"type": "STRING", "description": "owner/name"},
+            "path": {"type": "STRING", "description": "file path, e.g. 'fastapi/routing.py'"},
+        }, "required": ["repo", "path"]},
     ),
     types.FunctionDeclaration(
         name="playwright_browse",
