@@ -182,7 +182,7 @@ async def run_papers_with_events(
 if __name__ == "__main__":
 
     # TEST 1: real topic -> started, then completed, with papers
-    print("=== Test 1: real topic ===")
+    print("Test 1: real topic")
     events = []
     result = asyncio.run(
         run_papers_with_events("zero knowledge proofs", 3, "local-run", "local-task", events)
@@ -192,7 +192,7 @@ if __name__ == "__main__":
     print(json.dumps(events, indent=2))
 
     # TEST 2: nonsense topic -> started, then completed, with "No matching"
-    print("\n=== Test 2: nonsense topic ===")
+    print("\nTest 2: nonsense topic")
     events = []
     result = asyncio.run(
         run_papers_with_events("xqzvbnmkqq", 3, "local-run", "local-task", events)
@@ -201,7 +201,7 @@ if __name__ == "__main__":
     print(json.dumps(events, indent=2))
 
     # TEST 3: empty query -> started, then failed (raises an error)
-    print("\n=== Test 3: empty query ===")
+    print("\nTest 3: empty query")
     events = []
     try:
         asyncio.run(
