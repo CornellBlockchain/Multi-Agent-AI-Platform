@@ -5,6 +5,7 @@ import socket
 import time
 import uuid
 from datetime import datetime, timezone
+import re
 from urllib.parse import urlsplit
 
 import httpx
@@ -20,6 +21,33 @@ MAX_PAGE_CHARS = 8_000
 
 class ToolError(Exception):
     """tool failure with displayed message"""
+
+GITHUB_API = "https://api.github.com"
+REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+async def github_get(path: str, raw: bool = False) -> httpx.Response:
+    """Get from the github api. raw=True returns file contents as plain"""
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise ToolError("GITHUB_TOKEN not set!")
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        r = await client.get(f"{GITHUB_API}{path}", headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        })
+        if r.status_code == 404:
+            raise ToolError(f"Not found on GitHub: {path}")
+        if r.status_code != 200:
+            raise ToolError(f"GitHub returned HTTP {r.status_code}")
+        return r
+
+def check_repo(repo: str) -> str:
+    """accept 'owner/name' or a full GitHub URL, returns 'owner/name'."""
+    repo = repo.strip().removeprefix("https://github.com/").strip("/")
+    if not REPO_RE.match(repo):
+        raise ToolError(f"Expected 'owner/name', got '{repo}'")
+    return repo
 
 def emit(ctx, type, tool, tool_call_id, message, **extra):
     event = {
