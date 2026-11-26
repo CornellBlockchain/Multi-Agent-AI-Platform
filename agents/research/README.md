@@ -47,6 +47,46 @@ Use the [shared tool-result fields](../../shared/README.md#tool-results-and-live
 
 For missing keys, provider failures, or unreadable documents, return an understandable failure or limitation. A successful empty search should say that no matches were found.
 
+## Course Notes Search
+
+`tools/course_notes.py` searches local `.txt`, `.md` and `.markdown` files (recursively) for passages matching a question. PDFs are not supported yet. Real notes are not stored in this repository; each teammate provides their own copy.
+
+**Local:** put the notes anywhere on your machine and set `COURSE_NOTES_DIR` in `agents/research/.env` (see `.env.example`):
+
+```bash
+COURSE_NOTES_DIR=/Users/you/course-notes
+```
+
+**Container:** mount the folder read-only and point the setting at the mount path:
+
+```bash
+docker run -v /Users/you/course-notes:/course-notes:ro -e COURSE_NOTES_DIR=/course-notes <research-image>
+```
+
+**Calling it with activity events:**
+
+```python
+events = []
+result = await course_notes_search_with_events(
+    "How does gradient descent use the learning rate?",
+    run_id="run-1", task_id="task-1", events=events,
+)
+# result: {"message", "summary", "sources", "artifacts"}; events holds tool.started / tool.completed (or tool.failed)
+```
+
+`course_notes_search(query)` does the same without events. Both accept an optional `notes_dir` that overrides `COURSE_NOTES_DIR`. Quick try from the shell:
+
+```bash
+cd agents/research
+python -c "import asyncio; from tools.course_notes import course_notes_search as s; print(asyncio.run(s('your question'))['artifacts'])"
+```
+
+**Ranking:** notes are split into passages (paragraphs, tagged with their Markdown heading). Query words (minus stop words) are scored per passage by frequency weighted by rarity (IDF), with a small bonus for words in the heading or file name. Passages scoring 0 are dropped. Of the rest, only passages scoring at least 25% of the best passage (`MIN_RELATIVE_SCORE = 0.25`) are kept, up to 5 (`MAX_RESULTS`). The cutoff is relative, not absolute, so weak incidental matches are filtered out while several genuinely relevant passages can all be returned.
+
+**Sources:** local documents are listed by relative file name with `url: null`, so no web link is invented. Only files inside `COURSE_NOTES_DIR` are read. Unreadable files are skipped and counted in the summary. Do not commit course materials unless the team has confirmed they may be shared.
+
+**Still to do:** Gemini integration (using the returned passages to write answers) and testing with real course materials. PDFs are not supported yet. The Research Agent as a whole is not complete.
+
 ## Live Activity & Credentials
 
 Implement the [planned event lifecycle](../../shared/README.md#tool-results-and-live-activity): announce a tool before its work begins, then report completion or failure. Send concise public messages such as “Searching Wikipedia” and “Found 3 pages.”
